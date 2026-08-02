@@ -157,18 +157,6 @@ print(f'best sharpe={best.sharpe:.3f} fitness={best.fitness:.4f}')
 
 ---
 
-## What still needs wiring
-
-| Item | Notes |
-|------|-------|
-| `omega_engine.py` stubs | `polymarket_client`, `deribit_client`, `gp_engine` commented-out and ready |
-| `/omega-dashboard` endpoint | Add to `api_server.py`; proxy exists in Express layer |
-| Full AST→WAT compiler | `sandbox/wasm_compiler.py` `_ast_to_wat()` is a simplified template; full operator tree walk needed |
-| `wasmtime` package | `pip install wasmtime` + add to `requirements.txt`; currently uses SafePythonVM fallback |
-| PostgreSQL persistence | Schema in `lib/db/`; Drizzle not yet wired to engine |
-
----
-
 ## Design rule
 
 **Ship enforceable features.** Everything in `src/` compiles and runs. The architecture document (`ARCHITECTURE_v5.0.md`) describes the full vision; the codebase delivers the measured, enforceable substrate that makes everything else possible.

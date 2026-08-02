@@ -70,15 +70,6 @@ pnpm --filter @workspace/api-spec run codegen   # regenerate API hooks from Open
 - Exchange API clients and swarm infra (Redis, Neo4j) are present in the engine source but not started — engine runs in GP-VM-only mode by default.
 - The `omega_engine.py` orchestrator starts in `paper_trade=True` mode. Set `PAPER_TRADE=false` only after weeks of validation.
 
-## What still needs wiring
-
-| Item | Where |
-|------|-------|
-| `omega_engine.py` stubs | Plug in `polymarket_client`, `deribit_client`, `gp_engine` (code is commented-out and ready) |
-| `/omega-dashboard` API endpoint | Add to `src/api_server.py` + proxy in `api-server/src/routes/genesis.ts` |
-| AST → WASM code generator | `src/sandbox/wasm_compiler.py` `_ast_to_wat()` needs full expression-tree walk |
-| PostgreSQL persistence | `lib/db/` schema + Drizzle not yet wired to engine |
-
 ## Gotchas
 
 - `genetic_strategy_engine.py` uses bare imports (`from bytecode_vm import ...`). Always start via `python run.py` from `artifacts/genesis-engine/` — `run.py` inserts `src/vm/` onto `sys.path` first.

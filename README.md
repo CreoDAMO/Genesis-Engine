@@ -154,17 +154,6 @@ React 19 + Vite + Tailwind CSS + shadcn/ui. Dark terminal aesthetic (near-black,
 
 ---
 
-## What still needs wiring
-
-| Item | Where |
-|------|-------|
-| `omega_engine.py` stubs | Plug in `polymarket_client`, `deribit_client`, `gp_engine` — code is commented-out and ready |
-| `/omega-dashboard` API endpoint | Add to `src/api_server.py` → proxy in `api-server/src/routes/genesis.ts` |
-| AST → WASM code generator | `src/sandbox/wasm_compiler.py` `_ast_to_wat()` — currently simplified; full tree walk needed |
-| PostgreSQL persistence | `lib/db/` schema exists; Drizzle ORM not yet wired to engine |
-
----
-
 ## Design rule
 
 **Ship enforceable features.** Everything in `src/` compiles and runs. Architecture docs describe the full vision; the codebase delivers the measured, enforceable substrate that makes everything else possible.
