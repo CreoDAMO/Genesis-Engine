@@ -11,7 +11,8 @@ import {
   Play, 
   Square,
   RefreshCw,
-  Cpu
+  Cpu,
+  Waves,
 } from 'lucide-react';
 import { useSimulation } from '@/lib/store';
 import { cn } from '@/lib/utils';
@@ -43,6 +44,7 @@ export function ConsoleLayout({ children }: { children: React.ReactNode }) {
   const navItems = [
     { href: '/', label: 'Overview', icon: Activity },
     { href: '/strategies', label: 'Strategies', icon: Binary },
+    { href: '/market-making', label: 'Market Making', icon: Waves },
     { href: '/safety', label: 'Safety VM', icon: ShieldAlert },
     { href: '/portfolio', label: 'Portfolio', icon: Trophy },
     { href: '/audit', label: 'Audit Trail', icon: History },

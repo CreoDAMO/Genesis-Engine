@@ -11,6 +11,7 @@ import Strategies from '@/pages/Strategies';
 import Safety from '@/pages/Safety';
 import Portfolio from '@/pages/Portfolio';
 import Audit from '@/pages/Audit';
+import MarketMaking from '@/pages/MarketMaking';
 import NotFound from '@/pages/not-found';
 
 const queryClient = new QueryClient();
@@ -21,6 +22,7 @@ function Router() {
       <Switch>
         <Route path="/" component={Overview} />
         <Route path="/strategies" component={Strategies} />
+        <Route path="/market-making" component={MarketMaking} />
         <Route path="/safety" component={Safety} />
         <Route path="/portfolio" component={Portfolio} />
         <Route path="/audit" component={Audit} />

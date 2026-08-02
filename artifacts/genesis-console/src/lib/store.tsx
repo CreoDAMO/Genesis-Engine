@@ -1,4 +1,21 @@
 import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
+import type { GravityTick } from '@/components/charts/SkewHelix';
+import type { PopulationGenome } from '@/components/charts/PopulationLandscape';
+import type { MarketSurfacePoint } from '@/components/charts/RealitySurfacePanel';
+import type { PnlPoint } from '@/components/charts/EquityCurve';
+
+export type { GravityTick, PopulationGenome, MarketSurfacePoint, PnlPoint };
+
+export interface OmegaDashboard {
+  pnl_series: PnlPoint[];
+  population: PopulationGenome[];
+  surface: MarketSurfacePoint[];
+  helix: GravityTick[];
+  capital_by_strategy: { name: string; value: number }[];
+  trades_by_outcome: { outcome: string; count: number; pnl: number }[];
+  paper_trade: boolean;
+  wasm_fuel: number;
+}
 
 export interface GenerationData {
   generation: number;
@@ -41,6 +58,7 @@ interface SimulationState {
   hallOfFame: HallOfFameEntry[];
   settings: SimulationSettings;
   engineAvailable: boolean;
+  omega: OmegaDashboard | null;
   toggleRun: () => void;
   updateSetting: (key: keyof SimulationSettings, value: number) => void;
   resetRun: () => void;
@@ -98,6 +116,7 @@ export function SimulationProvider({ children }: { children: React.ReactNode }) 
   const [auditTrail, setAuditTrail] = useState<AuditLog[]>([]);
   const [hallOfFame, setHallOfFame] = useState<HallOfFameEntry[]>([]);
   const [engineAvailable, setEngineAvailable] = useState(false);
+  const [omega, setOmega] = useState<OmegaDashboard | null>(null);
   const [settings, setSettings] = useState<SimulationSettings>(() => {
     try {
       const saved = localStorage.getItem('genesis-settings');
@@ -139,6 +158,10 @@ export function SimulationProvider({ children }: { children: React.ReactNode }) 
     if (hist) setHistory(hist);
     if (hof) setHallOfFame(hof);
     if (audit) setAuditTrail(audit);
+
+    // Omega dashboard — optional, non-blocking
+    const omegaData = await apiGet<OmegaDashboard>('/omega-dashboard');
+    if (omegaData) setOmega(omegaData);
   }, []);
 
   // Start polling on mount; keep polling every second
@@ -206,6 +229,7 @@ export function SimulationProvider({ children }: { children: React.ReactNode }) 
       hallOfFame,
       settings,
       engineAvailable,
+      omega,
       toggleRun,
       updateSetting,
       resetRun,
