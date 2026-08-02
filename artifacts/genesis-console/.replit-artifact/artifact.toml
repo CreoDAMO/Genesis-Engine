@@ -9,7 +9,7 @@ router = "path"
 [[services]]
 name = "web"
 paths = [ "/" ]
-localPort = 20153
+localPort = 5173
 
 [services.development]
 run = "pnpm --filter @workspace/genesis-console run dev"
@@ -24,5 +24,5 @@ from = "/*"
 to = "/index.html"
 
 [services.env]
-PORT = "20153"
+PORT = "5173"
 BASE_PATH = "/"

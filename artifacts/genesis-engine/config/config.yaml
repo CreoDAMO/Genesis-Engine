@@ -1,0 +1,64 @@
+# Genesis Engine v5.0 — Production Configuration
+# DO NOT commit real keys. Use env vars or .env file.
+
+polymarket:
+  api_key: ${POLYMARKET_API_KEY}
+  api_secret: ${POLYMARKET_API_SECRET}
+  passphrase: ${POLYMARKET_PASSPHRASE}
+  base_url: https://clob.polymarket.com
+  ws_url: wss://ws-subscriptions-clob.polymarket.com/ws/market
+  chain_id: 137  # Polygon
+  usdc_contract: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+binance:
+  api_key: ${BINANCE_API_KEY}
+  api_secret: ${BINANCE_API_SECRET}
+  base_url: https://fapi.binance.com
+  ws_url: wss://fstream.binance.com/ws
+  testnet: false
+
+bybit:
+  api_key: ${BYBIT_API_KEY}
+  api_secret: ${BYBIT_API_SECRET}
+  base_url: https://api.bybit.com
+  ws_url: wss://stream.bybit.com/v5/public/linear
+  testnet: false
+
+deribit:
+  client_id: ${DERIBIT_CLIENT_ID}
+  client_secret: ${DERIBIT_CLIENT_SECRET}
+  base_url: https://www.deribit.com/api/v2
+  ws_url: wss://www.deribit.com/ws/api/v2
+  testnet: false
+
+redis:
+  host: localhost
+  port: 6379
+  db: 0
+  decode_responses: true
+
+neo4j:
+  uri: bolt://localhost:7687
+  user: neo4j
+  password: genesis_password
+
+llm:
+  provider: openai  # or anthropic
+  api_key: ${OPENAI_API_KEY}
+  model: gpt-4o
+  temperature: 0.2
+  max_tokens: 4096
+
+risk:
+  max_portfolio_exposure_usd: 100000
+  max_single_market_exposure_usd: 20000
+  max_drawdown_pct: 0.15
+  daily_loss_limit_usd: 5000
+  kelly_fraction: 0.25
+  cvar_confidence: 0.95
+
+execution:
+  default_slippage_bps: 10
+  max_order_retry: 3
+  order_timeout_sec: 30
+  ws_reconnect_delay_sec: 5

@@ -32,7 +32,7 @@ const fetchBtcPrice = async (): Promise<string> => {
 
 export function ConsoleLayout({ children }: { children: React.ReactNode }) {
   const [location] = useLocation();
-  const { isRunning, toggleRun, generation } = useSimulation();
+  const { isRunning, toggleRun, generation, engineAvailable } = useSimulation();
 
   const { data: btcPrice, isLoading: isBtcLoading, refetch } = useQuery({
     queryKey: ['btc-price'],
@@ -141,6 +141,14 @@ export function ConsoleLayout({ children }: { children: React.ReactNode }) {
           </div>
 
           <div className="flex items-center gap-3">
+            {/* Engine connectivity indicator */}
+            <div className="flex items-center gap-1.5 font-mono text-xs">
+              <Cpu className={cn("w-3.5 h-3.5", engineAvailable ? "text-emerald-500" : "text-muted-foreground/40")} />
+              <span className={engineAvailable ? "text-emerald-500" : "text-muted-foreground/40"}>
+                {engineAvailable ? 'ENGINE LIVE' : 'ENGINE OFFLINE'}
+              </span>
+            </div>
+
             <button
               onClick={toggleRun}
               className={cn(
