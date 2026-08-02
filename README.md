@@ -1,189 +1,170 @@
-# Genesis Engine v5.0 — Production Stack
-## Recursive Autopoietic Alpha Organism
+# Genesis Strategy Console
 
-> **Axiom:** *"The final form of alpha is not extraction. It is creation."*
+An evolutionary trading-strategy research platform built as a pnpm monorepo on Replit. A Python engine evolves expression-tree strategies using a fuel-metered bytecode VM and genetic programming; an Express proxy bridges it to a React terminal console that visualises fitness, market-making state, and an immutable audit trail in real time.
 
 ---
 
-## File Tree
+## Monorepo layout
 
 ```
-genesis_engine_v5/
-├── ARCHITECTURE_v5.0.md          # Full v5 design document (vision)
-├── README.md                      # This file
-├── config/
-│   └── config.yaml                # API keys, risk limits, infra endpoints
-├── docker-compose.yml             # Redis + Neo4j services
-├── requirements.txt               # Python dependencies
-├── src/
-│   ├── __init__.py
-│   ├── main.py                    # Production orchestrator (event loop)
-│   ├── config_loader.py           # YAML config with env var substitution
-│   ├── api/
-│   │   ├── __init__.py
-│   │   ├── polymarket_client.py   # CLOB REST + WS, auth, order mgmt
-│   │   ├── binance_client.py      # USD-M perps, funding, order book
-│   │   ├── bybit_client.py        # V5 unified trading, perps
-│   │   └── deribit_client.py      # Options + futures, signature auth
-│   ├── microstructure/
-│   │   ├── __init__.py
-│   │   ├── orderbook.py           # Unified L2, VPIN, OFI, trade intensity
-│   │   ├── slippage_model.py      # Book-walk + power-law extrapolation
-│   │   └── toxic_flow.py          # VPIN + Kyle lambda + adverse selection
-│   ├── strategies/
-│   │   ├── __init__.py
-│   │   ├── base.py                # Abstract strategy with risk/slippage hooks
-│   │   ├── funding_arb.py         # Cross-venue funding rate arbitrage
-│   │   ├── perp_hedge.py          # Delta-neutral Polymarket -> CEX hedge
-│   │   └── llm_invention.py       # GPT-4o strategy invention + auto-deploy
-│   ├── risk/
-│   │   ├── __init__.py
-│   │   ├── position_manager.py    # Multi-venue position book + exposure limits
-│   │   └── portfolio_risk.py      # CVaR, correlation, drawdown circuit breakers
-│   ├── swarm/
-│   │   ├── __init__.py
-│   │   ├── redis_cache.py         # Pub/sub signals, agent registry, state cache
-│   │   └── neo4j_graph.py         # Knowledge graph: strategies, alphas, agents
-│   └── vm/
-│       ├── __init__.py
-│       ├── bytecode_vm.py         # Fuel-metered stack VM (containment boundary)
-│       ├── genetic_strategy_engine.py  # GP evolution, causal DAG, regime shifts
-│       ├── portfolio.py           # Ensemble evaluation (Sharpe, Calmar, DD)
-│       ├── audit_trail.py         # Immutable hash-chained JSONL
-│       └── measure_boundary.py    # 7-test containment stress suite
-└── tests/
-    ├── __init__.py
-    └── test_microstructure.py     # Unit tests for book, slippage, toxic flow
+/
+├── artifacts/
+│   ├── genesis-engine/          # Python — aiohttp API + GP engine (port 8000)
+│   ├── api-server/              # Express 5 — proxy & REST layer (port 8080)
+│   └── genesis-console/         # React + Vite terminal console (artifact-managed port)
+├── lib/
+│   ├── api-spec/                # OpenAPI spec → typed hooks via Orval codegen
+│   └── db/                      # Drizzle ORM schema (PostgreSQL, not yet wired)
+├── pnpm-workspace.yaml
+└── README.md
 ```
 
 ---
 
-## What is implemented
+## Services
 
-### Tier 1: Containment Substrate (from v5.0-alpha)
-
-| Layer | File | Status |
-|-------|------|--------|
-| Fuel-metered bytecode VM | `vm/bytecode_vm.py` | Live — 16 opcodes, stack limits, compile-depth guards |
-| Genetic expression-tree evolution | `vm/genetic_strategy_engine.py` | Live — tournament selection, subtree crossover, point mutation |
-| Causal / intervention terminals | `vm/genetic_strategy_engine.py` | Live — confounder → imbalance → mid DAG, do(imbalance) |
-| Regime-shift world model | `vm/genetic_strategy_engine.py` | Live — calm ↔ stress switching mid-path |
-| Strategy ensemble / portfolio | `vm/portfolio.py` | Live — Sharpe, Calmar, max drawdown, pairwise correlation |
-| Immutable audit trail | `vm/audit_trail.py` | Live — append-only JSONL with hash chain |
-| Boundary stress suite | `vm/measure_boundary.py` | Live — fuel exhaustion, stack overflow, compiler rejection, determinism, throughput, adversarial failure |
-
-### Tier 2: Live Market Infrastructure
-
-| Layer | File | Status |
-|-------|------|--------|
-| Polymarket CLOB client | `api/polymarket_client.py` | Live — REST + WS, HMAC auth, order book reconstruction, position tracking |
-| Binance USD-M Futures | `api/binance_client.py` | Live — perps, funding rates, klines, order mgmt |
-| Bybit V5 Unified | `api/bybit_client.py` | Live — linear perps, funding, order book streaming |
-| Deribit Options + Futures | `api/deribit_client.py` | Live — signature auth, options chain, perp hedging |
-| Unified order book | `microstructure/orderbook.py` | Live — multi-venue L2 aggregation, weighted mid, depth, imbalance |
-| Slippage model | `microstructure/slippage_model.py` | Live — book-walk + power-law depth extrapolation |
-| Toxic flow detector | `microstructure/toxic_flow.py` | Live — VPIN, Kyle lambda, OFI, adverse selection |
-
-### Tier 3: Strategy Suite
-
-| Strategy | File | Logic |
-|----------|------|-------|
-| Funding Arbitrage | `strategies/funding_arb.py` | Scans Binance/Bybit/Deribit funding rates. Shorts high, longs low when divergence > threshold + carry > costs. |
-| Perp Hedge | `strategies/perp_hedge.py` | Maintains delta-neutral book. Polymarket position → auto-hedge via cheapest CEX perp. |
-| LLM Invention | `strategies/llm_invention.py` | Prompts GPT-4o with market regime + DSL. Compiles to AST, backtests in VM, auto-deploys if >20% improvement. |
-
-### Tier 4: Risk & Execution
-
-| Layer | File | Status |
-|-------|------|--------|
-| Position manager | `risk/position_manager.py` | Live — multi-venue position book, exposure limits, leverage caps |
-| Portfolio risk engine | `risk/portfolio_risk.py` | Live — CVaR(95%), correlation monitoring, drawdown + daily loss circuit breakers |
-| Strategy base class | `strategies/base.py` | Live — pre-flight risk checks, slippage estimation, enable/disable |
-
-### Tier 5: Swarm Infrastructure
-
-| Layer | File | Status |
-|-------|------|--------|
-| Redis cache | `swarm/redis_cache.py` | Live — pub/sub alpha signals, funding rate cache, position state, agent heartbeat |
-| Neo4j knowledge graph | `swarm/neo4j_graph.py` | Live — semantic triples: (Agent)-[:REPORTS]->(Alpha)-[:TARGETS]->(Market) |
-| Orchestrator | `main.py` | Live — async event loop, background tasks, graceful shutdown |
+| Service | Workflow | Technology | Role |
+|---------|----------|------------|------|
+| Genesis Engine | `Genesis Engine (Python)` | aiohttp + numpy | GP evolution, market data, VM |
+| API Server | `artifacts/api-server: API Server` | Express 5 + TypeScript | Proxy `/api/genesis/*` to Python |
+| Genesis Console | `artifacts/genesis-console: web` | React + Vite + Tailwind | Terminal UI |
 
 ---
 
-## Feature Vector (16 terminals)
-
-```
-0-9   mid, spread, imbalance, volume, rsi, zscore, momentum, volatility, time_frac, prev_signal
-10-13 do_imbalance, causal_mid, shock, confounder     ← causal / intervention
-14-15 regime, regime_age                              ← regime indicators
-```
-
----
-
-## Quick Start
-
-### 1. Start infrastructure
+## Quick start (Replit)
 
 ```bash
-docker-compose up -d
+pnpm install                       # install all workspace deps
+# Restart all three workflows from the workflow panel, then open the preview
 ```
 
-### 2. Configure secrets
-
 ```bash
-export POLYMARKET_API_KEY="..."
-export POLYMARKET_API_SECRET="..."
-export POLYMARKET_PASSPHRASE="..."
-export BINANCE_API_KEY="..."
-export BINANCE_API_SECRET="..."
-export BYBIT_API_KEY="..."
-export BYBIT_API_SECRET="..."
-export DERIBIT_CLIENT_ID="..."
-export DERIBIT_CLIENT_SECRET="..."
-export OPENAI_API_KEY="..."
-```
-
-### 3. Install & run
-
-```bash
+# Python deps (genesis engine only)
+cd artifacts/genesis-engine
 pip install -r requirements.txt
-python -m src.main
-```
-
-### 4. Run tests
-
-```bash
-pytest tests/
-```
-
-### 5. Run VM boundary suite
-
-```bash
-python -m src.vm.measure_boundary
-```
-
-### 6. Run genetic evolution demo
-
-```bash
-python -m src.vm.genetic_strategy_engine
 ```
 
 ---
 
-## Architecture vs Implementation
+## Python engine — `artifacts/genesis-engine/`
 
-| Vision (ARCHITECTURE_v5.0.md) | Status | Notes |
-|---|---|---|
-| Autopoietic Strategy Genesis (GP + LLM) | **Implemented** | `genetic_strategy_engine.py` + `llm_invention.py` |
-| World Simulator (causal DAG) | **Implemented** | Synthetic causal DAG in `generate_synthetic_markets()` |
-| Market Genesis Protocol | Architecture | On-chain market creation requires UMA/Kleros oracle integration |
-| Multi-Agent Swarm Treasury | **Partial** | Redis + Neo4j swarm layer live; DAO treasury & legal personhood are architecture |
-| Biological Immunity | Architecture | Adaptive patch generation requires TEE-ZK mesh + LLM critique loop |
-| Recursive Self-Improvement | Architecture | Singularity Loop requires host-code rewriting + sandbox A/B testing |
-| Quantum Annealing | Architecture | D-Wave/QAOA integration is future work |
+### Entry points
+
+| File | Purpose |
+|------|---------|
+| `run.py` | aiohttp server entry point — sets `sys.path`, starts `api_server.py` on port 8000 |
+| `omega_engine.py` | Standalone v6 orchestrator — 5 async loops: price ingestion (1 s), quoting (3 s), risk monitor (10 s), GP evolution (30 min), audit heartbeat (60 s). `paper_trade=True` by default. |
+
+### `src/vm/` — Containment substrate (v5 + v6 patches)
+
+| File | What it does |
+|------|-------------|
+| `bytecode_vm.py` | Fuel-metered stack VM. 16 opcodes, stack/depth guards. **v6:** `safe_div` returns NaN for x/~0; `safe_log` returns NaN for non-positive; `safe_exp` bounds ±709/745. |
+| `genetic_strategy_engine.py` | GP engine: tournament selection, subtree crossover, point mutation, causal DAG terminals, regime-shift world model. **v6:** `StrategyGenome.sharpe` field; `FitnessGate` on every eval; Sharpe-first `_pick_parent`; diversity-preserving `evolve` with 15% re-seeding. |
+| `portfolio.py` | Ensemble metrics: Sharpe, Calmar, max drawdown, pairwise correlation. |
+| `audit_trail.py` | Append-only hash-chained JSONL audit log. |
+| `measure_boundary.py` | 7-test containment stress suite (fuel exhaustion, stack overflow, compiler rejection, determinism, throughput, adversarial). |
+
+### `src/patches/` — v6 safety layer
+
+| File | Key classes |
+|------|------------|
+| `vm_hardening_patch.py` | `SafeMath` (NaN-propagating div/log/exp), `FitnessGate` (6-layer sanitizer, hard cap ±1000, kills positive-fitness/negative-Sharpe genomes), `AuditSanitizer` (poison detection before JSONL write) |
+| `gp_selection_fixes.py` | `LexicographicSelector` (Sharpe-first tournament), `DiversityPreserver` (niche penalty + re-seeding), `SharpeFirstElitism` |
+
+### `src/reality_surface/` — v6 probability consensus
+
+| File | What it does |
+|------|-------------|
+| `claim_normalizer.py` | `RealitySurface` — ingests PM prices, Deribit options IV, funding rates, insurance premiums; emits confidence-weighted consensus probability. `find_divergence()` returns cross-venue edge signals. |
+
+### `src/gravity/` — v6 market making
+
+| File | What it does |
+|------|-------------|
+| `lp_dominance.py` | `GravityMarketMaker` — inventory-skewed Polymarket CLOB quoting: dynamic spread, phase-shifted bid/ask curves driven by net inventory, auto-hedge callback. |
+
+### `src/sandbox/` — v6 execution sandbox
+
+| File | What it does |
+|------|-------------|
+| `wasm_compiler.py` | `WASMStrategyCompiler` — compiles GP expression trees to WASM binary via `wasmtime` (fuel-metered, deterministic). Falls back to `SafePythonVM` if wasmtime is not installed (`pip install wasmtime` to enable). |
+
+### `src/api/` — Market connectors (present, not started by default)
+
+`polymarket_client.py`, `binance_client.py`, `bybit_client.py`, `deribit_client.py` — REST + WebSocket clients. Wired as stubs in `omega_engine.py`; active once credentials are in env secrets.
+
+### `src/microstructure/`
+
+`orderbook.py` (unified L2, VPIN, OFI), `slippage_model.py` (book-walk + power-law), `toxic_flow.py` (Kyle lambda, adverse selection).
+
+### `src/strategies/`
+
+`funding_arb.py`, `perp_hedge.py`, `llm_invention.py` (GPT-4o strategy invention + auto-deploy).
+
+### `src/risk/`
+
+`position_manager.py` (multi-venue exposure), `portfolio_risk.py` (CVaR 95%, drawdown circuit breakers).
+
+### Feature vector (16 terminals)
+
+```
+0–9   mid, spread, imbalance, volume, rsi, zscore, momentum, volatility, time_frac, prev_signal
+10–13 do_imbalance, causal_mid, shock, confounder    ← causal / intervention
+14–15 regime, regime_age                             ← regime indicators
+```
 
 ---
 
-## Design Rule
+## API Server — `artifacts/api-server/`
 
-**Ship enforceable features.** Everything in `src/` compiles and runs. The architecture document describes the full vision; the codebase delivers the measured, enforceable substrate that makes everything else possible.
+Express 5 + TypeScript. Proxies all `/api/genesis/*` requests to the Python engine on port 8000. Add new routes in `src/routes/genesis.ts`.
+
+---
+
+## Genesis Console — `artifacts/genesis-console/`
+
+React 19 + Vite + Tailwind CSS + shadcn/ui. Dark terminal aesthetic (near-black, neon green/amber/red palette).
+
+### Pages
+
+| Route | What you see |
+|-------|-------------|
+| `/` Overview | P&L hero + live equity sparkline, dual-axis fitness/Sharpe chart, Population Landscape scatter (100 genomes by Sharpe tier), engine parameter sliders |
+| `/market-making` | **Skew Helix** — sinusoidal bid/ask visualization driven by `GravityMarketMaker` inventory skew; inventory gauge; Reality Surface probability bars per market |
+| `/strategies` | Hall-of-Fame strategy list with expression trees |
+| `/safety` | Safety VM metrics |
+| `/portfolio` | Capital composition donut, trades-by-outcome bar chart, curated strategy archive |
+| `/audit` | Immutable audit trail viewer |
+
+### Data flow
+
+- `src/lib/store.tsx` polls `/api/genesis/*` every 1 s when the engine is running.
+- `omega` field in store holds live data from `/api/genesis/omega-dashboard` (endpoint stub — returns `null` until wired on Python side; all charts fall back to synthetic live data automatically).
+- All chart components in `src/components/charts/` ship with animated synthetic fallback data so the terminal always looks alive.
+
+### Chart components
+
+| Component | File |
+|-----------|------|
+| Equity sparkline + P&L hero | `EquityCurve.tsx` |
+| GP population scatter | `PopulationLandscape.tsx` |
+| Sinusoidal bid/ask helix | `SkewHelix.tsx` |
+| Probability gauges per market | `RealitySurfacePanel.tsx` |
+
+---
+
+## What still needs wiring
+
+| Item | Where |
+|------|-------|
+| `omega_engine.py` stubs | Plug in `polymarket_client`, `deribit_client`, `gp_engine` — code is commented-out and ready |
+| `/omega-dashboard` API endpoint | Add to `src/api_server.py` → proxy in `api-server/src/routes/genesis.ts` |
+| AST → WASM code generator | `src/sandbox/wasm_compiler.py` `_ast_to_wat()` — currently simplified; full tree walk needed |
+| PostgreSQL persistence | `lib/db/` schema exists; Drizzle ORM not yet wired to engine |
+
+---
+
+## Design rule
+
+**Ship enforceable features.** Everything in `src/` compiles and runs. Architecture docs describe the full vision; the codebase delivers the measured, enforceable substrate that makes everything else possible.
