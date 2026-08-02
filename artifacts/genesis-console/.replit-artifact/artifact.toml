@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Genesis Strategy Console"
+description = "A bounded quantitative research console for evolving safe trading strategies on synthetic regime-shifting markets, comparing portfolio fitness, inspecting VM containment, and viewing optional public Coinbase market context without live order execution."
+version = "1.0.0"
+id = "artifacts/genesis-console"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 20153
+
+[services.development]
+run = "pnpm --filter @workspace/genesis-console run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/genesis-console", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/genesis-console/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "20153"
+BASE_PATH = "/"

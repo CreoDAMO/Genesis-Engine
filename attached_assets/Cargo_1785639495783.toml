@@ -1,0 +1,9 @@
+[package]
+name = "strategy_sandbox"
+version = "0.1.0"
+edition = "2021"
+description = "Genesis Engine strategy execution sandbox (Wasmtime host)"
+
+[dependencies]
+wasmtime = "12.0"
+anyhow = "1.0"
