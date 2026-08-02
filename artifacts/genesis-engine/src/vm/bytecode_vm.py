@@ -299,15 +299,26 @@ def execute(
         return stack.pop()
 
     def safe_div(a: float, b: float) -> float:
+        # v6 hardening: return NaN (not 0) so poisoned strategies are killed.
+        # 0/0 → 0 (neutral); x/0 → NaN (propagates to fitness, kills genome).
         if abs(b) < 1e-12:
-            return 0.0
+            return 0.0 if abs(a) < 1e-12 else float("nan")
         return a / b
 
     def safe_log(x: float) -> float:
-        return math.log(max(x, 1e-12))
+        # v6 hardening: return NaN for non-positive input instead of clamping.
+        # This kills strategies that rely on log(negative) being a valid signal.
+        if x <= 0.0:
+            return float("nan")
+        return math.log(x)
 
     def safe_exp(x: float) -> float:
-        return math.exp(min(max(x, -20.0), 20.0))
+        # v6 hardening: proper overflow bounds (was ±20, now ±709/745).
+        if x > 709.0:
+            return float("inf")
+        if x < -745.0:
+            return 0.0
+        return math.exp(x)
 
     def clip(x: float) -> float:
         return max(-1.0, min(1.0, x))

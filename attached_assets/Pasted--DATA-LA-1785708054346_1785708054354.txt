@@ -1,0 +1,51 @@
+┌─────────────────────────────────────────────────────────────────┐
+│                        DATA LAYER                                │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
+│  │ Polymarket   │  │ Deribit      │  │ Funding Rate APIs    │  │
+│  │ WebSocket    │  │ WebSocket    │  │ (Binance, dYdX)      │  │
+│  └──────┬───────┘  └──────┬───────┘  └──────────┬───────────┘  │
+└─────────┼─────────────────┼─────────────────────┼──────────────┘
+          │                 │                     │
+          ▼                 ▼                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     REALITY SURFACE                              │
+│  • Normalizes all sources to probability [0, 1]                  │
+│  • Confidence-weighted consensus                                 │
+│  • Detects cross-venue divergences > 2.5%                        │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      GRAVITY LP ENGINE                           │
+│  • Quotes bid/ask around consensus fair price                    │
+│  • Inventory skew: pushes quotes to reduce buildup               │
+│  • Dynamic spread: wider when volatile or near resolution        │
+│  • Auto-hedge on Deribit when inventory > 80% limit              │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     WASM SANDBOX                                 │
+│  • Compiles GP strategies to deterministic bytecode              │
+│  • Fuel metering: 10k instruction cap per evaluation             │
+│  • No memory access outside buffer, no syscalls                  │
+│  • Falls back to SafePythonVM if wasmtime unavailable            │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   GENETIC PROGRAMMING                            │
+│  • Sharpe-first tournament selection                             │
+│  • Diversity preservation: re-seed when clones dominate          │
+│  • Niche penalty: fitness reduced for overrepresented patterns   │
+│  • Elitism: top 5% by Sharpe survive automatically               │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      AUDIT CHAIN                                 │
+│  • Every evaluation cryptographically hashed                     │
+│  • Chain integrity: prev_hash links to previous record           │
+│  • Poison detection: NaN/Inf caught before writing               │
+│  • Output: logs/audit_omega.jsonl                                │
+└─────────────────────────────────────────────────────────────────┘

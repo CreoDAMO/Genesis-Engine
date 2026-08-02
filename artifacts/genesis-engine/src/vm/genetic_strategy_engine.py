@@ -24,6 +24,18 @@ import numpy as np
 from bytecode_vm import compile_ast, execute, MAX_FUEL, FEATURE_INDEX
 from audit_trail import AuditTrail
 
+# v6 patches: fitness gating, audit sanitization, Sharpe-first selection
+import sys as _sys
+import os as _os
+_patches_dir = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "patches")
+if _patches_dir not in _sys.path:
+    _sys.path.insert(0, _patches_dir)
+try:
+    from vm_hardening_patch import FitnessGate as _FitnessGate, AuditSanitizer as _AuditSanitizer
+    _V6_HARDENING = True
+except ImportError:
+    _V6_HARDENING = False
+
 # ---------------------------------------------------------------------------
 # Feature keys (must stay in sync with FEATURE_INDEX in bytecode_vm.py)
 # ---------------------------------------------------------------------------
@@ -73,6 +85,7 @@ class StrategyGenome:
     ast_tree: ast.AST
     source: str
     fitness: float = -np.inf
+    sharpe: float = 0.0          # v6: stored separately for Sharpe-first selection
     generation: int = 0
     parent_ids: List[str] = field(default_factory=list)
     genome_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
@@ -366,24 +379,43 @@ class GeneticStrategyEngine:
         # Occam penalty: smaller trees preferred
         occam = 1.0 / (1.0 + cs.n_ops * 0.01)
 
-        fitness = sharpe * max(0, calmar) * winrate * occam
+        raw_fitness = sharpe * max(0, calmar) * winrate * occam
+
+        # v6 hardening: gate fitness through FitnessGate (caps at ±1000, kills NaN,
+        # rejects positive fitness with negative Sharpe)
+        if _V6_HARDENING:
+            fitness, sharpe, valid, reason = _FitnessGate.gate(raw_fitness, sharpe, returns)
+            if not valid:
+                genome.fitness = -1e6
+                genome.sharpe = sharpe
+                return genome.fitness
+        else:
+            fitness = raw_fitness
+
         genome.fitness = fitness
+        genome.sharpe = sharpe
         genome.n_evals += 1
 
         # Audit trail
         if self.audit is not None:
             import hashlib
             bytecode_hash = hashlib.sha256(cs.code).hexdigest()[:16]
-            self.audit.log(
+            audit_record = dict(
                 event="EVAL",
                 genome_id=genome.genome_id,
                 source=genome.source,
                 bytecode_hash=bytecode_hash,
                 n_ops=cs.n_ops,
                 fitness=fitness,
+                sharpe=round(sharpe, 4),
                 fuel_limit=MAX_FUEL,
-                extra={"generation": genome.generation, "sharpe": round(sharpe, 4)},
+                extra={"generation": genome.generation},
             )
+            # v6 hardening: sanitize before writing to chain
+            if _V6_HARDENING:
+                audit_record = _AuditSanitizer.sanitize(audit_record)
+            self.audit.log(**{k: v for k, v in audit_record.items() if k != "extra"},
+                           extra=audit_record.get("extra", {}))
 
         return fitness
 
@@ -392,9 +424,21 @@ class GeneticStrategyEngine:
     # -----------------------------------------------------------------------
 
     def _pick_parent(self) -> StrategyGenome:
-        """Tournament selection (size 3)."""
+        """
+        Tournament selection (size 3) — v6: Sharpe-first lexicographic ranking.
+
+        Prevents fitness-explosion clones from winning: a strategy with
+        fitness=11M but Sharpe=-5.88 will never be selected over one with
+        fitness=0.8 and Sharpe=1.2.
+        """
         candidates = self.rng.sample(self.population, min(3, len(self.population)))
-        return max(candidates, key=lambda g: g.fitness)
+
+        # Split into viable (positive Sharpe) and fallback
+        viable = [c for c in candidates if c.sharpe > 0.0]
+        pool = viable if viable else candidates
+
+        # Lexicographic: Sharpe desc, then fitness desc
+        return max(pool, key=lambda g: (g.sharpe, g.fitness))
 
     def _mutate(self, genome: StrategyGenome) -> StrategyGenome:
         """Point mutation: replace a random subtree."""
@@ -481,20 +525,52 @@ class GeneticStrategyEngine:
     # -----------------------------------------------------------------------
 
     def evolve(self, market_data: Dict[str, np.ndarray]) -> StrategyGenome:
-        """Run one generation: evaluate, select, breed, replace."""
+        """
+        Run one generation: evaluate, select, breed, replace.
+
+        v6 improvements:
+          - NaN fitness guard before sort (prevents undefined sort behavior)
+          - Sharpe-first elitism (top performers selected by Sharpe, then fitness)
+          - Diversity tracking: log unique sources / population size each generation
+          - Periodic re-seeding: inject 15% random genomes every 5 generations
+            or when diversity drops below 85%
+        """
         # Evaluate all
         for g in self.population:
             self.evaluate(g, market_data)
 
-        # Sort by fitness
-        self.population.sort(key=lambda g: g.fitness, reverse=True)
+        # v6: NaN guard — replace any NaN/Inf fitness with floor before sorting
+        for g in self.population:
+            if not (g.fitness == g.fitness) or g.fitness == float("inf"):  # isnan or isinf
+                g.fitness = -1e6
+                g.sharpe = -5.0
 
-        # Update hall of fame
+        # v6: Sharpe-first elitism — sort by (sharpe, fitness) not just fitness.
+        # This prevents numerically explosive strategies from surviving as elites.
+        self.population.sort(key=lambda g: (g.sharpe, g.fitness), reverse=True)
+
+        # Update hall of fame (also Sharpe-first)
         for g in self.population[:self.elitism]:
             if not any(h.genome_id == g.genome_id for h in self.hall_of_fame):
                 self.hall_of_fame.append(copy.deepcopy(g))
-        self.hall_of_fame.sort(key=lambda g: g.fitness, reverse=True)
+        self.hall_of_fame.sort(key=lambda g: (g.sharpe, g.fitness), reverse=True)
         self.hall_of_fame = self.hall_of_fame[:20]
+
+        # v6: Diversity tracking
+        unique_sources = len(set(g.source for g in self.population))
+        diversity = unique_sources / len(self.population) if self.population else 0
+
+        # v6: Periodic re-seeding when diversity is low or every 5 generations
+        should_reseed = diversity < 0.85 or (self.generation > 0 and self.generation % 5 == 0)
+        if should_reseed:
+            n_seed = max(1, int(self.pop_size * 0.15))
+            # Keep elites + top survivors; replace bottom 15% with fresh random genomes
+            survivors = self.population[: self.pop_size - n_seed]
+            seeds = []
+            for _ in range(n_seed):
+                tree = self._grow_tree()
+                seeds.append(StrategyGenome(ast_tree=tree, source=ast.unparse(tree), generation=self.generation))
+            self.population = survivors + seeds
 
         # Elites survive
         new_pop = [copy.deepcopy(g) for g in self.population[:self.elitism]]
@@ -512,7 +588,16 @@ class GeneticStrategyEngine:
 
         self.population = new_pop
         self.generation += 1
-        return self.population[0]
+
+        best = self.population[0]
+        import logging as _logging
+        _logging.getLogger("genesis.gp").info(
+            f"[Gen {self.generation:3d}] "
+            f"best_sharpe={best.sharpe:6.3f} best_fit={best.fitness:8.4f} | "
+            f"diversity={diversity:.1%} ({unique_sources}/{self.pop_size}) "
+            f"reseeded={should_reseed}"
+        )
+        return best
 
 
 # ---------------------------------------------------------------------------

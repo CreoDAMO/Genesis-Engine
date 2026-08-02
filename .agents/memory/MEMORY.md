@@ -1,0 +1,2 @@
+- [v6 VM Hardening](v6-vm-hardening.md) — NaN-propagating SafeMath + FitnessGate cap at ±1000; gated into bytecode_vm.py and genetic_strategy_engine.py
+- [v6 Module Layout](v6-module-layout.md) — six new modules under artifacts/genesis-engine/src/{patches,reality_surface,gravity,sandbox} + omega_engine.py at root

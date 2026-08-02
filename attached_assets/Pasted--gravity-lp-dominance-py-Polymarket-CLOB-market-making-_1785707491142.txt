@@ -1,0 +1,414 @@
+"""
+gravity/lp_dominance.py
+
+Polymarket CLOB market making with inventory-aware quoting.
+The 'gravity' is simple: tight spreads + deep size = price discovery flows to you.
+
+Integrates with:
+- reality_surface for fair probability consensus
+- perp_hedge for cross-venue inventory management
+- polymarket_client for order placement
+"""
+
+from __future__ import annotations
+
+import time
+import asyncio
+import logging
+from dataclasses import dataclass
+from typing import Optional, Dict, List, Callable
+from collections import deque
+import numpy as np
+
+logger = logging.getLogger("gravity")
+
+
+@dataclass
+class Quote:
+    """A single-sided quote."""
+    side: str           # "bid" or "ask"
+    price: float        # [0.001, 0.999]
+    size: float         # Number of shares
+    market_id: str
+    
+    def __post_init__(self):
+        self.price = float(np.clip(self.price, 0.001, 0.999))
+        self.size = max(0.0, self.size)
+
+
+@dataclass  
+class InventoryState:
+    """Track net inventory across venues."""
+    market_id: str
+    pm_yes_shares: float = 0.0      # Net YES shares on Polymarket
+    pm_usdc_locked: float = 0.0     # USDC collateral locked
+    perp_delta: float = 0.0         # Equivalent delta on perp venue
+    
+    @property
+    def net_delta(self) -> float:
+        """Total directional exposure in share-equivalent units."""
+        return self.pm_yes_shares + self.perp_delta
+    
+    @property
+    def gross_exposure(self) -> float:
+        """Absolute exposure."""
+        return abs(self.pm_yes_shares) + abs(self.perp_delta)
+
+
+class GravityMarketMaker:
+    """
+    Inventory-skewed market maker for Polymarket CLOB.
+    
+    Core idea:
+    1. Compute fair probability from RealitySurface consensus
+    2. Quote bid/ask around fair with dynamic spread
+    3. Skew quotes away from inventory buildup
+    4. Hedge excess inventory on perp venue automatically
+    
+    Config:
+        target_spread: Base spread as fraction (e.g. 0.02 = 2%)
+        max_inventory: Max net shares before emergency hedge
+        skew_factor: How aggressively to skew (0.5 = moderate)
+        quote_size_base: Base order size in shares
+        min_spread: Minimum spread to prevent zero-width
+    """
+    
+    def __init__(
+        self,
+        polymarket_client,
+        reality_surface,
+        perp_hedger: Optional[Callable] = None,
+        target_spread: float = 0.02,
+        max_inventory: float = 5000.0,
+        skew_factor: float = 0.5,
+        quote_size_base: float = 100.0,
+        min_spread: float = 0.005,
+        emergency_hedge_threshold: float = 0.8,
+    ):
+        self.pm = polymarket_client
+        self.surface = reality_surface
+        self.perp_hedger = perp_hedger
+        
+        self.target_spread = target_spread
+        self.max_inventory = max_inventory
+        self.skew_factor = skew_factor
+        self.quote_size_base = quote_size_base
+        self.min_spread = min_spread
+        self.emergency_hedge_threshold = emergency_hedge_threshold
+        
+        # Inventory tracking per market
+        self.inventory: Dict[str, InventoryState] = {}
+        
+        # Active orders per market (for cancellation/replacement)
+        self.active_orders: Dict[str, List[dict]] = {}
+        
+        # PnL tracking
+        self.trade_history: deque = deque(maxlen=10_000)
+        self.realized_pnl: float = 0.0
+        
+        # Spread adjustment based on volatility
+        self.volatility_ewma: Dict[str, float] = {}
+        self.vol_lambda: float = 0.94  # EWMA decay
+    
+    # ------------------------------------------------------------------
+    # Core Quoting
+    # ------------------------------------------------------------------
+    
+    def compute_quotes(self, market_id: str) -> Optional[Dict[str, Quote]]:
+        """
+        Compute bid/ask quotes for a market.
+        
+        Returns {"bid": Quote, "ask": Quote} or None if no consensus.
+        """
+        # Get fair probability from reality surface
+        fair_prob = self.surface.consensus_probability(market_id)
+        if fair_prob is None:
+            logger.warning(f"[{market_id}] No consensus probability available")
+            return None
+        
+        # Get inventory state
+        inv = self.inventory.get(market_id, InventoryState(market_id=market_id))
+        
+        # Dynamic spread: wider when uncertain or volatile
+        spread = self._dynamic_spread(market_id, fair_prob)
+        
+        # Inventory skew: push quotes to reduce inventory
+        # If long YES, lower both bid and ask to encourage selling
+        skew = self._compute_skew(inv)
+        
+        # Calculate prices
+        half_spread = spread / 2.0
+        bid = fair_prob * (1.0 - half_spread + skew)
+        ask = fair_prob * (1.0 + half_spread + skew)
+        
+        # Enforce minimum spread
+        if ask - bid < self.min_spread:
+            mid = (bid + ask) / 2.0
+            bid = mid - self.min_spread / 2.0
+            ask = mid + self.min_spread / 2.0
+        
+        # Clip to valid range
+        bid = float(np.clip(bid, 0.001, 0.999))
+        ask = float(np.clip(ask, 0.001, 0.999))
+        
+        # Size: deeper when confident, thinner when inventory-heavy
+        confidence = self.surface.consensus_uncertainty(market_id)
+        if confidence is None:
+            confidence = 0.1
+        
+        # More size when fair prob is near 0.5 (more trading interest)
+        # Less size when near 0 or 1 (binary resolution risk)
+        prob_penalty = 1.0 - abs(fair_prob - 0.5) * 2.0  # 1.0 at 0.5, 0.0 at edges
+        
+        # Inventory penalty: reduce size as we approach max
+        inv_ratio = abs(inv.net_delta) / self.max_inventory
+        inv_penalty = max(0.0, 1.0 - inv_ratio ** 2)
+        
+        size = self.quote_size_base * (1.0 - confidence * 2) * prob_penalty * inv_penalty
+        size = max(1.0, size)  # Minimum 1 share
+        
+        return {
+            "bid": Quote(side="bid", price=bid, size=size, market_id=market_id),
+            "ask": Quote(side="ask", price=ask, size=size, market_id=market_id),
+            "fair": fair_prob,
+            "spread": spread,
+            "skew": skew
+        }
+    
+    def _dynamic_spread(self, market_id: str, fair_prob: float) -> float:
+        """Adjust spread based on volatility and probability."""
+        base = self.target_spread
+        
+        # Wider spread near resolution (0 or 1) due to jump risk
+        jump_risk = abs(fair_prob - 0.5) * 2.0  # 0 at 0.5, 1.0 at edges
+        base *= (1.0 + jump_risk * 2.0)
+        
+        # Wider spread when volatile
+        vol = self.volatility_ewma.get(market_id, 0.01)
+        base *= (1.0 + vol * 10.0)
+        
+        return float(np.clip(base, self.min_spread, 0.15))
+    
+    def _compute_skew(self, inv: InventoryState) -> float:
+        """
+        Compute inventory skew factor [-0.5, 0.5].
+        
+        Positive skew = raise prices (we're short, want to buy back higher)
+        Negative skew = lower prices (we're long, want to sell lower)
+        """
+        if self.max_inventory <= 0:
+            return 0.0
+        
+        ratio = inv.net_delta / self.max_inventory
+        skew = -ratio * self.skew_factor  # Negative because we want to reduce inventory
+        return float(np.clip(skew, -0.5, 0.5))
+    
+    # ------------------------------------------------------------------
+    # Order Management
+    # ------------------------------------------------------------------
+    
+    async def refresh_quotes(self, market_id: str):
+        """
+        Cancel old quotes and place new ones.
+        Call this every 1-5 seconds per market.
+        """
+        quotes = self.compute_quotes(market_id)
+        if quotes is None:
+            await self._cancel_all(market_id)
+            return
+        
+        # Cancel existing orders
+        await self._cancel_all(market_id)
+        
+        # Place new orders
+        new_orders = []
+        for side in ["bid", "ask"]:
+            q = quotes[side]
+            try:
+                order = await self.pm.place_order(
+                    market_id=market_id,
+                    side="BUY" if side == "bid" else "SELL",
+                    price=q.price,
+                    size=q.size,
+                    order_type="GTC"  # Good-til-cancelled
+                )
+                new_orders.append(order)
+                logger.info(
+                    f"[{market_id}] {side.upper()} @ {q.price:.4f} x {q.size:.1f} "
+                    f"(fair={quotes['fair']:.4f}, spread={quotes['spread']:.3%}, skew={quotes['skew']:+.3f})"
+                )
+            except Exception as e:
+                logger.error(f"[{market_id}] Failed to place {side}: {e}")
+        
+        self.active_orders[market_id] = new_orders
+    
+    async def _cancel_all(self, market_id: str):
+        """Cancel all active orders for a market."""
+        orders = self.active_orders.get(market_id, [])
+        for order in orders:
+            try:
+                await self.pm.cancel_order(order_id=order.get("id"))
+            except Exception as e:
+                logger.debug(f"Cancel failed (may already be filled): {e}")
+        self.active_orders[market_id] = []
+    
+    # ------------------------------------------------------------------
+    # Fill Handling & Inventory
+    # ------------------------------------------------------------------
+    
+    async def on_fill(self, fill_event: dict):
+        """
+        Process a fill from Polymarket WebSocket.
+        
+        Args:
+            fill_event: {
+                "market_id": str,
+                "side": "BUY" | "SELL",
+                "size": float,
+                "price": float,
+                "order_id": str
+            }
+        """
+        market_id = fill_event["market_id"]
+        side = fill_event["side"]
+        size = fill_event["size"]
+        price = fill_event["price"]
+        
+        # Update inventory
+        if market_id not in self.inventory:
+            self.inventory[market_id] = InventoryState(market_id=market_id)
+        
+        inv = self.inventory[market_id]
+        
+        if side == "BUY":
+            inv.pm_yes_shares += size
+            inv.pm_usdc_locked += size * price
+        else:
+            inv.pm_yes_shares -= size
+            inv.pm_usdc_locked -= size * price
+        
+        # Track trade
+        self.trade_history.append({
+            "timestamp": time.time(),
+            "market_id": market_id,
+            "side": side,
+            "size": size,
+            "price": price,
+            "pnl": 0.0  # Realized on exit
+        })
+        
+        logger.info(
+            f"[{market_id}] FILL {side} {size:.1f} @ {price:.4f} | "
+            f"Net delta: {inv.net_delta:+.1f}"
+        )
+        
+        # Check for emergency hedge
+        await self._check_hedge(market_id)
+    
+    async def _check_hedge(self, market_id: str):
+        """Hedge inventory if it exceeds threshold."""
+        inv = self.inventory.get(market_id)
+        if not inv:
+            return
+        
+        ratio = abs(inv.net_delta) / self.max_inventory
+        
+        if ratio >= self.emergency_hedge_threshold:
+            logger.warning(
+                f"[{market_id}] EMERGENCY HEDGE triggered: "
+                f"{inv.net_delta:+.1f} / {self.max_inventory} ({ratio:.1%})"
+            )
+            await self._hedge_inventory(market_id)
+    
+    async def _hedge_inventory(self, market_id: str):
+        """
+        Cross-hedge excess inventory on perp venue.
+        
+        Calls the perp_hedger callback if provided.
+        """
+        if self.perp_hedger is None:
+            logger.warning(f"[{market_id}] No perp hedger configured — inventory unhedged!")
+            return
+        
+        inv = self.inventory[market_id]
+        
+        # Determine hedge direction: opposite of net delta
+        if inv.net_delta > 0:
+            # Long YES on PM → Short perp to hedge
+            hedge_side = "SELL"
+            hedge_size = inv.net_delta
+        else:
+            hedge_side = "BUY"
+            hedge_size = -inv.net_delta
+        
+        try:
+            hedge_result = await self.perp_hedger(
+                market_id=market_id,
+                side=hedge_side,
+                size=hedge_size
+            )
+            
+            # Update perp delta tracking
+            if hedge_side == "BUY":
+                inv.perp_delta += hedge_size
+            else:
+                inv.perp_delta -= hedge_size
+            
+            logger.info(
+                f"[{market_id}] HEDGED {hedge_side} {hedge_size:.1f} on perp | "
+                f"New net delta: {inv.net_delta:+.1f}"
+            )
+        except Exception as e:
+            logger.error(f"[{market_id}] Hedge failed: {e}")
+    
+    # ------------------------------------------------------------------
+    # Volatility Tracking
+    # ------------------------------------------------------------------
+    
+    def update_volatility(self, market_id: str, mid_price: float):
+        """Update EWMA volatility estimate from mid-price changes."""
+        if market_id not in self.volatility_ewma:
+            self.volatility_ewma[market_id] = 0.01
+            self._last_mid = {market_id: mid_price}
+            return
+        
+        last = self._last_mid.get(market_id, mid_price)
+        if last <= 0:
+            return
+        
+        ret = (mid_price - last) / last
+        old_vol = self.volatility_ewma[market_id]
+        new_vol = np.sqrt(
+            self.vol_lambda * old_vol**2 + (1 - self.vol_lambda) * ret**2
+        )
+        self.volatility_ewma[market_id] = float(new_vol)
+        self._last_mid[market_id] = mid_price
+    
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+    
+    def get_status(self) -> dict:
+        """Full status snapshot."""
+        total_inventory = sum(abs(inv.net_delta) for inv in self.inventory.values())
+        total_gross = sum(inv.gross_exposure for inv in self.inventory.values())
+        
+        return {
+            "timestamp": time.time(),
+            "n_markets": len(self.inventory),
+            "total_net_delta": total_inventory,
+            "total_gross_exposure": total_gross,
+            "n_active_orders": sum(len(o) for o in self.active_orders.values()),
+            "n_trades": len(self.trade_history),
+            "realized_pnl": self.realized_pnl,
+            "markets": {
+                mid: {
+                    "net_delta": inv.net_delta,
+                    "gross": inv.gross_exposure,
+                    "pm_shares": inv.pm_yes_shares,
+                    "perp_delta": inv.perp_delta,
+                    "vol": self.volatility_ewma.get(mid, 0.01)
+                }
+                for mid, inv in self.inventory.items()
+            }
+        }

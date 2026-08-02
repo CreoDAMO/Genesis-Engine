@@ -55,11 +55,36 @@ Users open the console, click **START RUN**, and watch the genetic algorithm evo
 
 _Populate as you build — explicit user instructions worth remembering across sessions._
 
+## v6 Omega Engine Modules
+
+Six new modules were added under `artifacts/genesis-engine/src/` as the practical v6 upgrade:
+
+| Module | Path | What it does |
+|--------|------|-------------|
+| VM Hardening | `src/patches/vm_hardening_patch.py` | `SafeMath` (NaN-propagating div/log/exp), `FitnessGate` (cap at ±1000, Sharpe gate), `AuditSanitizer` |
+| GP Selection Fixes | `src/patches/gp_selection_fixes.py` | `LexicographicSelector` (Sharpe-first), `DiversityPreserver` (re-seeding), `SharpeFirstElitism` |
+| Reality Surface | `src/reality_surface/claim_normalizer.py` | Unified probability from PM + Deribit + funding rates; divergence detection |
+| Gravity LP | `src/gravity/lp_dominance.py` | Inventory-skewed market making on Polymarket CLOB |
+| WASM Sandbox | `src/sandbox/wasm_compiler.py` | Deterministic fuel-metered strategy execution (SafePythonVM fallback if wasmtime absent) |
+| Omega Orchestrator | `omega_engine.py` | 5-loop event engine tying everything together; start with `python omega_engine.py` |
+
+### What was patched in existing files
+
+- `src/vm/bytecode_vm.py` — `safe_div` now returns NaN (not 0) for x/~0; `safe_log` returns NaN for non-positive; `safe_exp` bounds widened to ±709/745.
+- `src/vm/genetic_strategy_engine.py` — `StrategyGenome` gains `sharpe` field; fitness is gated through `FitnessGate`; `_pick_parent` uses Sharpe-first tournament; `evolve` uses Sharpe-first elitism + diversity tracking + periodic re-seeding.
+
+### What still needs wiring (stubs in omega_engine.py)
+
+- `polymarket_client` → your existing `src/api/polymarket_client.py`
+- `deribit_client` → your existing `src/api/deribit_client.py`
+- `gp_engine` → your existing `src/vm/genetic_strategy_engine.py`
+
 ## Gotchas
 
 - `genetic_strategy_engine.py` uses bare imports (`from bytecode_vm import ...`). `run.py` inserts `src/vm/` onto `sys.path` before importing, so always start via `python run.py` from `artifacts/genesis-engine/`, not directly.
 - The `Genesis Console` and `API Server` workflows must be running for the browser UI to show "ENGINE LIVE"; the Python engine must also be running for evolution to work.
 - Port 20153 (original genesis-console port) is not in configureWorkflow's supported list; the artifact.toml and workflow both now use port 5173.
+- The v6 patch modules in `src/patches/` must be on `sys.path` for `genetic_strategy_engine.py` to import them. The path injection at the top of that file handles this automatically.
 
 ## Pointers
 

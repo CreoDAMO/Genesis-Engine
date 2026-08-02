@@ -1,0 +1,217 @@
+"""
+vm_hardening_patch.py
+
+Drop-in safety guards for your existing bytecode_vm.py.
+
+Apply these changes to your VM to fix the numerical instability
+that produced 11.6M fitness outliers in the audit log.
+
+Integration:
+    from vm_hardening_patch import SafeMath, FitnessGate
+    
+    # In your VM opcode handlers:
+    result = SafeMath.div(a, b)  # Instead of a / b
+    result = SafeMath.log(x)     # Instead of math.log(x)
+    
+    # In your fitness evaluator:
+    fitness, sharpe, valid = FitnessGate.evaluate(signals, backtest_df)
+"""
+
+import math
+import numpy as np
+from typing import Tuple, Dict
+
+
+class SafeMath:
+    """
+    Hardened math operations that never produce inf, -inf, or division-by-zero artifacts.
+    
+    All operations return NaN on invalid input, which poisons the fitness function
+    and kills the genome.
+    """
+    
+    EPS: float = 1e-9
+    MAX_EXP_ARG: float = 709.0   # ln(MAX_FLOAT) ≈ 709
+    MIN_EXP_ARG: float = -745.0  # ln(MIN_POS_FLOAT) ≈ -745
+    
+    @classmethod
+    def div(cls, a: float, b: float) -> float:
+        """Guarded division."""
+        if abs(b) < cls.EPS:
+            if abs(a) < cls.EPS:
+                return 0.0  # 0/0 → neutral
+            return float('nan')  # x/0 → poison
+        return a / b
+    
+    @classmethod
+    def log(cls, x: float) -> float:
+        """Guarded natural log."""
+        if x <= 0.0:
+            return float('nan')
+        return math.log(x)
+    
+    @classmethod
+    def log10(cls, x: float) -> float:
+        """Guarded base-10 log."""
+        if x <= 0.0:
+            return float('nan')
+        return math.log10(x)
+    
+    @classmethod
+    def sqrt(cls, x: float) -> float:
+        """Guarded square root."""
+        if x < 0.0:
+            return float('nan')
+        return math.sqrt(x)
+    
+    @classmethod
+    def exp(cls, x: float) -> float:
+        """Guarded exponential with overflow protection."""
+        if x > cls.MAX_EXP_ARG:
+            return float('inf')
+        if x < cls.MIN_EXP_ARG:
+            return 0.0
+        return math.exp(x)
+    
+    @classmethod
+    def pow(cls, base: float, exp: float) -> float:
+        """Guarded power."""
+        try:
+            result = math.pow(base, exp)
+            if not math.isfinite(result):
+                return float('nan')
+            return result
+        except (ValueError, OverflowError):
+            return float('nan')
+
+
+class FitnessGate:
+    """
+    Hardened fitness evaluation with sanity checks.
+    
+    This replaces your raw fitness computation to prevent:
+    - NaN/Inf poisoning
+    - Single-trade lottery wins
+    - Positive fitness with negative Sharpe
+    - Runaway numerical explosions
+    """
+    
+    MAX_FITNESS: float = 1_000.0
+    MIN_TRADES: int = 10
+    MAX_SINGLE_RETURN: float = 0.50  # No single trade >50%
+    MIN_SHARPE_FOR_POSITIVE_FITNESS: float = 0.5
+    
+    @classmethod
+    def evaluate(cls, 
+                 signals: np.ndarray, 
+                 backtest_df,
+                 leverage_cap: float = 1.0) -> Tuple[float, float, bool, str]:
+        """
+        Evaluate strategy signals with full safety gating.
+        
+        Args:
+            signals: Array of strategy signals per tick
+            backtest_df: DataFrame with 'returns' column
+            leverage_cap: Max position size (1.0 = 1x)
+        
+        Returns:
+            (fitness, sharpe, is_valid, reason)
+        """
+        
+        # --- GATE 1: No NaN/Inf in signals ---
+        if not np.isfinite(signals).all():
+            return -1.0, -5.0, False, "non_finite_signals"
+        
+        # --- Compute positions and returns ---
+        positions = np.clip(signals, -leverage_cap, leverage_cap)
+        
+        # Shift positions to avoid lookahead bias
+        # Position at time t earns return from t to t+1
+        if len(positions) < 2 or len(backtest_df) < 2:
+            return -1.0, -5.0, False, "insufficient_data"
+        
+        returns = positions[:-1] * backtest_df['returns'].values[1:]
+        
+        # --- GATE 2: Minimum trade count ---
+        # Count position changes above threshold
+        pos_changes = np.abs(np.diff(positions))
+        n_trades = int(np.sum(pos_changes > 0.01))
+        if n_trades < cls.MIN_TRADES:
+            return -1.0, -5.0, False, f"insufficient_trades:{n_trades}"
+        
+        # --- GATE 3: No lottery trades ---
+        if len(returns) > 0:
+            max_single = np.max(np.abs(returns))
+            if max_single > cls.MAX_SINGLE_RETURN:
+                return -1.0, -5.0, False, f"lottery_trade:{max_single:.3f}"
+        
+        # --- GATE 4: No NaN/Inf in returns ---
+        if not np.isfinite(returns).all():
+            return -1.0, -5.0, False, "non_finite_returns"
+        
+        # --- Cumulative PnL ---
+        cumulative = np.cumsum(returns)
+        total_pnl = float(cumulative[-1])
+        
+        # --- Sharpe (annualized for 5-min bars) ---
+        if len(returns) > 1 and returns.std() > 1e-12:
+            sharpe = float((returns.mean() / returns.std()) * np.sqrt(252 * 288))
+        else:
+            sharpe = -5.0
+        
+        if not math.isfinite(sharpe):
+            return -1.0, -5.0, False, "non_finite_sharpe"
+        
+        # --- Drawdown penalty ---
+        running_max = np.maximum.accumulate(cumulative)
+        drawdown = float(np.max(running_max - cumulative))
+        
+        # Avoid division by zero
+        pnl_magnitude = max(abs(total_pnl), 0.01)
+        dd_penalty = max(0.0, 1.0 - drawdown / pnl_magnitude)
+        
+        # --- Raw fitness ---
+        raw_fitness = total_pnl * dd_penalty * max(0.0, sharpe)
+        
+        # --- GATE 5: Hard cap ---
+        fitness = float(np.clip(raw_fitness, -cls.MAX_FITNESS, cls.MAX_FITNESS))
+        
+        # --- GATE 6: Sharpe must be positive for positive fitness ---
+        if sharpe < cls.MIN_SHARPE_FOR_POSITIVE_FITNESS and fitness > 0:
+            fitness = -1.0
+            return fitness, sharpe, False, "positive_pnl_negative_sharpe"
+        
+        return fitness, sharpe, True, "ok"
+
+
+class AuditSanitizer:
+    """
+    Sanitize records before writing to audit chain.
+    
+    Catches poisoned evaluations that slipped through and prevents
+    them from corrupting the audit log.
+    """
+    
+    @staticmethod
+    def sanitize(record: dict) -> dict:
+        """Clean a record before writing to JSONL."""
+        fitness = record.get("fitness", 0)
+        sharpe = record.get("sharpe", 0)
+        
+        # Detect poison
+        if not (math.isfinite(fitness) and math.isfinite(sharpe)):
+            record["fitness"] = -FitnessGate.MAX_FITNESS
+            record["sharpe"] = -5.0
+            record["valid"] = False
+            record["poison_detected"] = True
+        
+        # Cap fitness if it somehow exceeded bounds
+        if abs(record.get("fitness", 0)) > FitnessGate.MAX_FITNESS:
+            record["fitness"] = float(np.clip(
+                record["fitness"], 
+                -FitnessGate.MAX_FITNESS, 
+                FitnessGate.MAX_FITNESS
+            ))
+            record["capped"] = True
+        
+        return record
