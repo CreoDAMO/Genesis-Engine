@@ -181,20 +181,34 @@ class OmegaEngine:
         self.surface = RealitySurface()
         logger.info("[Surface] Reality surface initialized")
 
-        # 3. Polymarket client — plug in your existing connector here
-        #   self.pm_client = PolymarketCLOB(
-        #       api_key=self.cfg.pm_api_key,
-        #       api_secret=self.cfg.pm_api_secret,
-        #       passphrase=self.cfg.pm_passphrase,
-        #   )
-        logger.info("[PM]      Client placeholder (wire up PolymarketCLOB)")
+        # 3. Polymarket client
+        if self.cfg.pm_api_key:
+            try:
+                from api.polymarket_client import PolymarketClient
+                self.pm_client = PolymarketClient(
+                    api_key=self.cfg.pm_api_key,
+                    api_secret=self.cfg.pm_api_secret,
+                    passphrase=self.cfg.pm_passphrase,
+                )
+                logger.info("[PM]      PolymarketClient initialized (LIVE)")
+            except Exception as e:
+                logger.error(f"[PM]      Failed to init PolymarketClient: {e}")
+        else:
+            logger.info("[PM]      No credentials — set PM_API_KEY/PM_API_SECRET/PM_PASSPHRASE to activate")
 
-        # 4. Deribit client — plug in your existing connector here
-        #   self.deribit_client = DeribitAPI(
-        #       key=self.cfg.deribit_key,
-        #       secret=self.cfg.deribit_secret,
-        #   )
-        logger.info("[Deribit] Client placeholder (wire up DeribitAPI)")
+        # 4. Deribit client
+        if self.cfg.deribit_key:
+            try:
+                from api.deribit_client import DeribitClient
+                self.deribit_client = DeribitClient(
+                    client_id=self.cfg.deribit_key,
+                    client_secret=self.cfg.deribit_secret,
+                )
+                logger.info("[Deribit] DeribitClient initialized (LIVE)")
+            except Exception as e:
+                logger.error(f"[Deribit] Failed to init DeribitClient: {e}")
+        else:
+            logger.info("[Deribit] No credentials — set DERIBIT_KEY/DERIBIT_SECRET to activate")
 
         # 5. Gravity LP
         from gravity.lp_dominance import GravityMarketMaker
@@ -208,14 +222,17 @@ class OmegaEngine:
         )
         logger.info("[Gravity] LP engine initialized")
 
-        # 6. GP engine — plug in your existing GeneticStrategyEngine here
-        #   from vm.genetic_strategy_engine import GeneticStrategyEngine, generate_synthetic_markets
-        #   self.gp_engine = GeneticStrategyEngine(
-        #       population_size=self.cfg.gp_population_size,
-        #       seed=42,
-        #   )
-        #   self.gp_engine.initialize()
-        logger.info("[GP]      Strategy engine placeholder (wire up GeneticStrategyEngine)")
+        # 6. GP engine
+        try:
+            from vm.genetic_strategy_engine import GeneticStrategyEngine
+            self.gp_engine = GeneticStrategyEngine(
+                population_size=self.cfg.gp_population_size,
+                seed=42,
+            )
+            self.gp_engine.initialize()
+            logger.info(f"[GP]      GeneticStrategyEngine initialized (pop={self.cfg.gp_population_size})")
+        except Exception as e:
+            logger.error(f"[GP]      Failed to init GeneticStrategyEngine: {e}")
 
         # 7. Signal handlers
         loop = asyncio.get_event_loop()
@@ -403,13 +420,17 @@ class OmegaEngine:
         while not self._shutdown_event.is_set():
             try:
                 if self.gp_engine is not None:
-                    # from vm.genetic_strategy_engine import generate_synthetic_markets
-                    # data = generate_synthetic_markets(n_paths=50, n_steps=200)
-                    # best = self.gp_engine.evolve(data)
-                    # logger.info(f"[GP] Best: fit={best.fitness:.4f} sharpe={best.sharpe:.4f}")
-                    pass
+                    from vm.genetic_strategy_engine import generate_synthetic_markets
+                    data = generate_synthetic_markets(n_paths=50, n_steps=200)
+                    best = self.gp_engine.evolve(data)
+                    logger.info(
+                        f"[GP] Cycle complete — "
+                        f"gen={self.gp_engine.generation} "
+                        f"fit={best.fitness:.4f} sharpe={best.sharpe:.4f} "
+                        f"expr={best.source[:60]}"
+                    )
                 else:
-                    logger.info("[GP] Evolution cycle (placeholder — wire up gp_engine)")
+                    logger.info("[GP] Engine not initialized — skipping evolution cycle")
 
                 await asyncio.sleep(self.cfg.gp_cycle_sec)
 

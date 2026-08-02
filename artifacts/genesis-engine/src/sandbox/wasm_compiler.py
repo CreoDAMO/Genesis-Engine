@@ -165,10 +165,11 @@ class WASMStrategyCompiler:
         wasm_bytes = None
         if HAS_WASMTIME:
             wat = self._ast_to_wat(ast_source)
-            try:
-                wasm_bytes = wasmtime.Wat2Wasm(wat)
-            except Exception as e:
-                logger.warning(f"WASM compile failed for {strategy_id}: {e} — using fallback")
+            if wat is not None:
+                try:
+                    wasm_bytes = wasmtime.Wat2Wasm(wat)
+                except Exception as e:
+                    logger.warning(f"WASM compile failed for {strategy_id}: {e} — using fallback")
 
         python_fn = self._ast_to_python_fn(ast_source)
 
@@ -217,69 +218,272 @@ class WASMStrategyCompiler:
         return self._python_vm.execute(compiled.python_fn, features)
 
     # ------------------------------------------------------------------
-    # AST Translation (simplified — full walker is future work)
+    # AST → WAT (full recursive walker)
     # ------------------------------------------------------------------
 
-    def _ast_to_wat(self, ast_source: str) -> str:
+    def _ast_to_wat(self, ast_source: str) -> Optional[str]:
         """
-        Convert AST string to WAT. Simplified translator for demonstration:
-        detects dominant terminal and returns a sign-normalized version of it.
-        A production build would parse the full AST and emit the correct
-        instruction sequence for each operator node.
-        """
-        dominant = 0
-        for term, idx in TERMINAL_MAP.items():
-            if term in ast_source.lower():
-                dominant = idx
-                break
+        Full recursive AST-string → WAT converter.
 
-        return f"""
-        (module
-          (func $strategy (param f64 f64 f64 f64 f64 f64 f64 f64
-                                f64 f64 f64 f64 f64 f64 f64 f64)
-                          (result f64)
-            ;; Simplified: return the dominant feature (sign-normalized)
-            local.get {dominant}
-            f64.const 0.0
-            f64.lt
-            (if (result f64)
-              (then local.get {dominant} f64.neg)
-              (else local.get {dominant})
-            )
-          )
-          (export "strategy" (func $strategy))
-        )
+        Supported operators:
+          Binary : add, sub, mul, div (safe — NaN on ÷0), max, min
+          Unary  : neg, abs, sqrt, sign
+          Compare: gt, lt, ge, le, eq  (return f64 1.0 / 0.0)
+          Control: if_else(cond, then, else)
+          3-arg  : clip(x, lo, hi)
+          Terminals: any of the 16 named features, numeric literals
+
+        Returns None for expressions that contain log() or exp() —
+        those transcendentals have no native WASM instruction; the caller
+        falls back to SafePythonVM automatically.
         """
+        import ast as _py_ast
+
+        # WASM has no f64.log / f64.exp — fall back to Python for those
+        src_lower = ast_source.lower()
+        if "log(" in src_lower or "exp(" in src_lower:
+            return None
+
+        try:
+            tree = _py_ast.parse(ast_source, mode="eval")
+        except SyntaxError:
+            return None
+
+        # Temp-local counter — each safe_div / sign needs a scratch local
+        _tmp_count = [0]
+
+        def _alloc() -> str:
+            idx = _tmp_count[0]
+            _tmp_count[0] += 1
+            return f"$t{idx}"
+
+        def _emit(node: _py_ast.expr) -> List[str]:
+            """Return flat list of WAT instructions that leave one f64 on the stack."""
+
+            # ── Numeric literal ──────────────────────────────────────
+            if isinstance(node, _py_ast.Constant):
+                return [f"f64.const {float(node.value)}"]
+
+            # ── Feature terminal ─────────────────────────────────────
+            if isinstance(node, _py_ast.Name):
+                idx = TERMINAL_MAP.get(node.id, 0)
+                return [f"local.get $p{idx}"]
+
+            # ── Unary minus ──────────────────────────────────────────
+            if isinstance(node, _py_ast.UnaryOp) and isinstance(node.op, _py_ast.USub):
+                return _emit(node.operand) + ["f64.neg"]
+
+            # ── Function calls ───────────────────────────────────────
+            if isinstance(node, _py_ast.Call):
+                fn = (node.func.id if isinstance(node.func, _py_ast.Name) else "").lower()
+                args = node.args
+
+                # Simple binary arithmetic
+                _binary = {
+                    "add": "f64.add", "sub": "f64.sub", "mul": "f64.mul",
+                    "max": "f64.max", "maximum": "f64.max",
+                    "min": "f64.min", "minimum": "f64.min",
+                }
+                if fn in _binary and len(args) == 2:
+                    return _emit(args[0]) + _emit(args[1]) + [_binary[fn]]
+
+                # Simple unary
+                if fn in ("neg", "negate") and len(args) == 1:
+                    return _emit(args[0]) + ["f64.neg"]
+                if fn == "abs" and len(args) == 1:
+                    return _emit(args[0]) + ["f64.abs"]
+                if fn == "sqrt" and len(args) == 1:
+                    return _emit(args[0]) + ["f64.sqrt"]
+
+                # Safe div — emit b first, tee to local, check |b| < eps
+                if fn == "div" and len(args) == 2:
+                    tmp = _alloc()
+                    return (
+                        _emit(args[1]) +
+                        [f"local.tee {tmp}",
+                         "f64.abs",
+                         "f64.const 1e-9",
+                         "f64.lt",
+                         "if (result f64)",
+                         "  f64.const nan",
+                         "else"] +
+                        ["  " + i for i in _emit(args[0])] +
+                        [f"  local.get {tmp}",
+                         "  f64.div",
+                         "end"]
+                    )
+
+                # sign(x) → 1.0 if x ≥ 0 else -1.0
+                if fn == "sign" and len(args) == 1:
+                    tmp = _alloc()
+                    return (
+                        _emit(args[0]) +
+                        [f"local.tee {tmp}",
+                         "f64.const 0.0",
+                         "f64.ge",
+                         "if (result f64)",
+                         "  f64.const 1.0",
+                         "else",
+                         "  f64.const -1.0",
+                         "end"]
+                    )
+
+                # Comparisons → f64 1.0 or 0.0
+                _cmps = {"gt": "f64.gt", "lt": "f64.lt",
+                         "ge": "f64.ge", "le": "f64.le", "eq": "f64.eq"}
+                if fn in _cmps and len(args) == 2:
+                    return (
+                        _emit(args[0]) + _emit(args[1]) +
+                        [_cmps[fn],
+                         "if (result f64)",
+                         "  f64.const 1.0",
+                         "else",
+                         "  f64.const 0.0",
+                         "end"]
+                    )
+
+                # if_else(cond, then, else): cond is f64; non-zero → true branch
+                if fn == "if_else" and len(args) == 3:
+                    return (
+                        _emit(args[0]) +
+                        ["f64.const 0.0", "f64.ne",
+                         "if (result f64)"] +
+                        ["  " + i for i in _emit(args[1])] +
+                        ["else"] +
+                        ["  " + i for i in _emit(args[2])] +
+                        ["end"]
+                    )
+
+                # clip(x, lo, hi) → max(lo, min(hi, x))  (clamping order matters)
+                if fn == "clip" and len(args) == 3:
+                    return (
+                        _emit(args[0]) +
+                        _emit(args[1]) +
+                        ["f64.max"] +
+                        _emit(args[2]) +
+                        ["f64.min"]
+                    )
+
+                # Unknown call — evaluate first arg or push 0
+                if args:
+                    return _emit(args[0])
+                return ["f64.const 0.0"]
+
+            # Anything else (shouldn't occur in GP ASTs)
+            return ["f64.const 0.0"]
+
+        try:
+            body = _emit(tree.body)
+        except Exception as exc:
+            logger.debug(f"WAT emit error for '{ast_source[:60]}': {exc}")
+            return None
+
+        n_tmps = _tmp_count[0]
+        params      = " ".join(f"(param $p{i} f64)" for i in range(16))
+        locals_decl = "\n    ".join(f"(local $t{i} f64)" for i in range(n_tmps))
+        body_text   = "\n    ".join(body)
+
+        # Function body: optional locals, expression, output clamp to [-10, 10]
+        inner = f"{locals_decl}\n    " if locals_decl else ""
+        inner += f"{body_text}\n    f64.const -10.0\n    f64.max\n    f64.const 10.0\n    f64.min"
+
+        return (
+            f"(module\n"
+            f"  (func $strategy {params} (result f64)\n"
+            f"    {inner}\n"
+            f"  )\n"
+            f'  (export "strategy" (func $strategy))\n'
+            f")"
+        )
+
+    # ------------------------------------------------------------------
+    # AST → Python closure (full recursive evaluator, no eval())
+    # ------------------------------------------------------------------
 
     def _ast_to_python_fn(self, ast_source: str) -> Callable:
         """
-        Convert AST string to a Python closure for fallback execution.
-        No eval() — uses pattern matching over the AST string.
+        Convert AST string to a Python closure via full recursive AST evaluation.
+
+        Walks the parsed Python AST node tree — no eval(), no string matching.
+        All 16 feature terminals and all GP operator names are handled.
         """
-        src = ast_source.lower().strip()
+        import ast as _py_ast
+
+        try:
+            tree = _py_ast.parse(ast_source, mode="eval")
+            expr = tree.body
+        except SyntaxError:
+            return lambda features, vm: 0.0
+
+        def _eval(node: _py_ast.expr, features: List[float], vm: SafePythonVM) -> float:
+            vm._burn()
+
+            if isinstance(node, _py_ast.Constant):
+                return float(node.value)
+
+            if isinstance(node, _py_ast.Name):
+                idx = TERMINAL_MAP.get(node.id, 0)
+                return float(features[idx]) if idx < len(features) else 0.0
+
+            if isinstance(node, _py_ast.UnaryOp) and isinstance(node.op, _py_ast.USub):
+                return -_eval(node.operand, features, vm)
+
+            if isinstance(node, _py_ast.Call):
+                fn = (node.func.id if isinstance(node.func, _py_ast.Name) else "").lower()
+                args = node.args
+
+                # Lazy evaluation for if_else — only evaluate the taken branch
+                if fn == "if_else" and len(args) == 3:
+                    cond = _eval(args[0], features, vm)
+                    return _eval(args[1], features, vm) if cond != 0.0 else _eval(args[2], features, vm)
+
+                # Eagerly evaluate all other args
+                eargs = [_eval(a, features, vm) for a in args]
+
+                _ops: dict = {
+                    "add":      lambda a, b:      a + b,
+                    "sub":      lambda a, b:      a - b,
+                    "mul":      lambda a, b:      a * b,
+                    "div":      lambda a, b:      vm.safe_div(a, b),
+                    "neg":      lambda a:         -a,
+                    "negate":   lambda a:         -a,
+                    "abs":      lambda a:         abs(a),
+                    "sqrt":     lambda a:         vm.safe_sqrt(a),
+                    "log":      lambda a:         vm.safe_log(a),
+                    "exp":      lambda a:         vm.safe_exp(a),
+                    "sign":     lambda a:         1.0 if a > 0 else (-1.0 if a < 0 else 0.0),
+                    "max":      lambda a, b:      max(a, b),
+                    "maximum":  lambda a, b:      max(a, b),
+                    "min":      lambda a, b:      min(a, b),
+                    "minimum":  lambda a, b:      min(a, b),
+                    "gt":       lambda a, b:      1.0 if a > b else 0.0,
+                    "lt":       lambda a, b:      1.0 if a < b else 0.0,
+                    "ge":       lambda a, b:      1.0 if a >= b else 0.0,
+                    "le":       lambda a, b:      1.0 if a <= b else 0.0,
+                    "eq":       lambda a, b:      1.0 if a == b else 0.0,
+                    "clip":     lambda a, lo, hi: max(lo, min(hi, a)),
+                    "pow":      lambda a, b:      (
+                        math.pow(abs(a), min(abs(b), 4.0)) if abs(a) > 1e-9 else 0.0
+                    ),
+                }
+
+                if fn in _ops:
+                    return _ops[fn](*eargs)
+
+            return 0.0
+
+        # Capture the parsed node in the closure (parse once, evaluate many times)
+        _expr = expr
 
         def strategy_fn(features: List[float], vm: SafePythonVM) -> float:
-            f = {
-                name: float(features[i]) if i < len(features) else 0.0
-                for i, name in enumerate(FEATURE_NAMES)
-            }
-            if "sign" in src and "zscore" in src:
-                return 1.0 if f["zscore"] > 0 else (-1.0 if f["zscore"] < 0 else 0.0)
-            if "sign" in src and "imbalance" in src:
-                return 1.0 if f["imbalance"] > 0 else (-1.0 if f["imbalance"] < 0 else 0.0)
-            if "sign" in src and "regime" in src:
-                return 1.0 if f["regime"] > 0.5 else -1.0
-            if "neg" in src and "zscore" in src:
-                return -f["zscore"]
-            if "abs" in src and "zscore" in src:
-                return abs(f["zscore"])
-            if "momentum" in src:
-                return f["momentum"]
-            if "rsi" in src:
-                return (f["rsi"] - 50) / 50
-            if "imbalance" in src:
-                return f["imbalance"]
-            return f["zscore"]
+            vm._fuel = vm.MAX_FUEL
+            try:
+                result = _eval(_expr, features, vm)
+                if not math.isfinite(result):
+                    return float("nan")
+                return float(np.clip(result, -10.0, 10.0))
+            except Exception:
+                return float("nan")
 
         return strategy_fn
 

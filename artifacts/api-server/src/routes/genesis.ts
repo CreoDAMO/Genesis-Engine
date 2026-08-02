@@ -54,6 +54,11 @@ router.get("/hall-of-fame", (req, res) =>
 );
 router.get("/audit", (req, res) => proxyToEngine("/audit", req, res));
 
+// Omega dashboard (Market Making terminal)
+router.get("/omega-dashboard", (req, res) =>
+  proxyToEngine("/omega-dashboard", req, res),
+);
+
 // Writes
 router.post("/settings", (req, res) => proxyToEngine("/settings", req, res));
 router.post("/hall-of-fame", (req, res) =>

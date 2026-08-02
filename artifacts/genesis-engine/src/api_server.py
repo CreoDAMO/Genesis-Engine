@@ -314,6 +314,79 @@ async def handle_settings(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "settings": state.settings})
 
 
+async def handle_omega_dashboard(request: web.Request) -> web.Response:
+    """
+    Omega dashboard snapshot consumed by the React Market Making terminal.
+
+    Builds OmegaDashboard-shaped JSON from live engine state so the console
+    receives real data as soon as an evolution run is in progress.
+    """
+    import math as _math
+
+    # ── P&L series: cumulative sum of (maxFitness * scale) per generation ──
+    pnl_series = []
+    cumulative = 0.0
+    for i, h in enumerate(state.history):
+        fit = h.get("maxFitness", 0.0)
+        cumulative += fit * 50.0   # scale fitness → rough USD units
+        pnl_series.append({"t": i, "pnl": round(cumulative, 2)})
+
+    # ── Population landscape: one dot per genome ────────────────────────────
+    population = []
+    if state.gp_engine is not None:
+        for idx, genome in enumerate(state.gp_engine.population):
+            fit = float(genome.fitness) if _math.isfinite(genome.fitness) else 0.0
+            shp = float(getattr(genome, "sharpe", 0.0))
+            shp = shp if _math.isfinite(shp) else 0.0
+            complexity = max(1, len(genome.source.split("(")) - 1)
+            population.append({
+                "id": f"g{idx}",
+                "sharpe":     round(shp, 3),
+                "fitness":    round(fit, 4),
+                "complexity": complexity,
+                "generation": getattr(state.gp_engine, "generation", state.generation),
+            })
+
+    # ── Capital by strategy: weighted by Hall-of-Fame Sharpe ───────────────
+    hof = state.hall_of_fame
+    total_sharpe = sum(max(e.get("outOfSampleSharpe", 0.01), 0.01) for e in hof) or 1.0
+    capital_by_strategy = [
+        {
+            "name": e.get("name", "Unknown")[:22],
+            "value": round(
+                max(e.get("outOfSampleSharpe", 0.01), 0.01) / total_sharpe * 10_000, 2
+            ),
+        }
+        for e in hof[:8]
+    ] if hof else [{"name": "Unallocated", "value": 10000}]
+
+    # ── Trades by outcome: count gens + P&L per regime ─────────────────────
+    regimes = ["BULL", "BEAR", "VOLATILE"]
+    trades_by_outcome = [
+        {
+            "outcome": r,
+            "count":   sum(1 for h in state.history if h.get("regime") == r),
+            "pnl":     round(
+                sum(h.get("maxFitness", 0.0) * 50.0
+                    for h in state.history if h.get("regime") == r),
+                2,
+            ),
+        }
+        for r in regimes
+    ]
+
+    return web.json_response({
+        "pnl_series":          pnl_series,
+        "population":          population,
+        "surface":             [],   # populated by Reality Surface when wired
+        "helix":               [],   # populated by Gravity LP when wired
+        "capital_by_strategy": capital_by_strategy,
+        "trades_by_outcome":   trades_by_outcome,
+        "paper_trade":         True,
+        "wasm_fuel":           state.settings.get("maxFuelPerEval", 5000),
+    })
+
+
 async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
@@ -341,6 +414,7 @@ async def cors_middleware(request: web.Request, handler: Any) -> web.Response:
 def create_app() -> web.Application:
     app = web.Application(middlewares=[cors_middleware])
     app.router.add_get("/healthz", handle_health)
+    app.router.add_get("/omega-dashboard", handle_omega_dashboard)
     app.router.add_get("/status", handle_status)
     app.router.add_post("/start", handle_start)
     app.router.add_post("/stop", handle_stop)
