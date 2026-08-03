@@ -1,0 +1,282 @@
+# Analysis
+
+I cloned the repo and traced this all the way to a root cause. Here's what's actually going on:
+
+**The fitness hard cap is being violated in ~32% of all evaluations** — 8,518 of 26,532 records in `audit_live.jsonl` have `|fitness| > 1000`, despite the README and `vm_hardening_patch.py`'s own docstring stating FitnessGate clips fitness to ±1000. Real values in the log go as high as **132,267,995** and as low as **-1,244,999**.
+
+**Why, confirmed via git history:**
+- `genetic_strategy_engine.py` was first created at **06:15:52 UTC** with *unguarded* `raw_fitness = sharpe * max(0, calmar) * winrate * occam` — no cap at all. Your audit log starts 23 seconds later.
+- `vm_hardening_patch.py` (FitnessGate) didn't exist in the repo until commit `d6017ad` at **22:12:10 UTC** — over 16 hours later, by which point ~2,800 uncapped evaluations had already been logged.
+- Here's the real problem: **violations continued after that commit landed.** Before 22:12:10: 443/2,804 evals violated the cap (15.8%). After 22:12:10: 8,075/23,728 violated (**34.0%** — worse, not better), with the single largest violation (132M) occurring at 22:42, thirty minutes after the "fix" was committed.
+- I checked out `main` fresh and ran the actual import — `FitnessGate.gate()` works correctly and does clip to ±1000 when the current code runs. So the committed fix is not broken. **The live Replit process generating this log simply never picked it up** — it's still running old, unguarded code in memory.
+
+One caveat worth noting: the "no positive-fitness-with-negative-Sharpe" invariant holds throughout the log with zero violations, but that's not evidence the gate is working — `raw_fitness`'s sign is mechanically tied to `sharpe`'s sign by the formula itself (since `calmar`, `winrate`, `occam` are all non-negative), so that invariant holds even with zero hardening active. It's a coincidence of the math, not a working safeguard.
+
+Chain integrity itself is solid — 0 unexplained hash-chain breaks, 0 NaN/Inf, just 5 legitimate "genesis" restarts matching engine restarts.
+
+**Bottom line:** the fix is real and correct in source, but production needs a restart/redeploy of `omega_engine.py` to actually load it — right now every strategy your GP engine is evolving against is being scored on unbounded, unsanitized fitness.
+
+This is excellent root cause analysis. You found the exact failure mode I should have warned about: committed code ≠ running code. The `FitnessGate` is correct in source, but the live Replit process is a zombie running 16-hour-old bytecode. Let me give you the tooling to fix this permanently.
+
+---
+
+What You Found (Confirmed)
+
+Finding	Implication	
+34% violation rate post-commit	The "fix" never reached the live process	
+132M max fitness	Unguarded `raw_fitness = sharpe * calmar * winrate * occam` with no cap	
+Zero hash-chain breaks	Audit infrastructure is solid — the problem is evaluation, not logging	
+Positive-fitness/negative-Sharpe invariant	Mathematical coincidence (`calmar`, `winrate`, `occam` ≥ 0), not a working safeguard	
+
+Your diagnosis is exactly right: the live Replit process forked before `d6017ad` and never reloaded. Every generation since then has been evolving against unbounded fitness, which means your GP is selecting for numerical explosions, not alpha.
+
+---
+
+Immediate Fix: Hot-Reload + Verification
+
+1. Add a File-System Watcher to `omega_engine.py`
+
+This detects when `vm_hardening_patch.py` changes on disk and forces a module reload:
+
+```python
+# Add to omega_engine.py, inside OmegaEngine.__init__
+
+import os
+import importlib
+
+self._patch_path = os.path.abspath("src/patches/vm_hardening_patch.py")
+self._patch_mtime = os.path.getmtime(self._patch_path)
+
+async def _hot_reload_loop(self):
+    """Watch for source changes and reload modules without restart."""
+    while not self._shutdown_event.is_set():
+        await asyncio.sleep(30.0)
+        
+        current_mtime = os.path.getmtime(self._patch_path)
+        if current_mtime > self._patch_mtime:
+            self._patch_mtime = current_mtime
+            
+            try:
+                import src.patches.vm_hardening_patch as vmp
+                importlib.reload(vmp)
+                
+                # Re-import into the GP engine's namespace
+                if self.gp_engine:
+                    self.gp_engine.FitnessGate = vmp.FitnessGate
+                    self.gp_engine.SafeMath = vmp.SafeMath
+                
+                logger.critical(
+                    "[HOT RELOAD] vm_hardening_patch.py reloaded. "
+                    "FitnessGate.MAX_FITNESS = %s",
+                    vmp.FitnessGate.MAX_FITNESS
+                )
+                
+                # Verify it actually took effect
+                test_fitness = vmp.FitnessGate.MAX_FITNESS + 1
+                assert vmp.FitnessGate.evaluate(
+                    np.array([1.0]), 
+                    pd.DataFrame({'returns': [0.1]})
+                )[0] <= vmp.FitnessGate.MAX_FITNESS
+                
+            except Exception as e:
+                logger.error(f"[HOT RELOAD] Failed: {e}")
+
+# Add to start() gather:
+# self._hot_reload_loop()
+```
+
+2. Add a Runtime Verification Probe
+
+This logs the actual cap value every evaluation, so you can confirm in the audit trail whether the running code matches the committed code:
+
+```python
+# In genetic_strategy_engine.py, inside evaluate_fitness()
+
+# PROBE: Log the effective cap value so audit shows if hardening is active
+fitness, sharpe, valid, reason = FitnessGate.evaluate(signals, backtest_df)
+
+self.audit_log.append({
+    "timestamp": time.time(),
+    "genome_id": genome.id,
+    "fitness": fitness,
+    "sharpe": sharpe,
+    "valid": valid,
+    "reason": reason,
+    # CRITICAL: This proves which code is running
+    "_fitness_cap": getattr(FitnessGate, 'MAX_FITNESS', 'MISSING'),
+    "_patch_mtime": os.path.getmtime(
+        os.path.abspath("src/patches/vm_hardening_patch.py")
+    ),
+    "hash": ...
+})
+```
+
+If `_fitness_cap` is `MISSING` or `1000` but `fitness` is `132267995`, you know the gate was bypassed.
+
+3. Add a Startup Assertion
+
+This fails fast if the engine starts with old code:
+
+```python
+# At the bottom of omega_engine.py, before main()
+
+def _verify_hardening_active():
+    """Fail startup if FitnessGate is not loaded or not clipping."""
+    from src.patches.vm_hardening_patch import FitnessGate
+    import numpy as np
+    import pandas as pd
+    
+    # Synthetic test: a strategy that would produce fitness > 1000 without the gate
+    fake_signals = np.array([1000.0] * 20)  # Would explode without cap
+    fake_df = pd.DataFrame({'returns': np.random.randn(20) * 0.01})
+    
+    fitness, sharpe, valid, reason = FitnessGate.evaluate(fake_signals, fake_df)
+    
+    assert abs(fitness) <= FitnessGate.MAX_FITNESS, (
+        f"CRITICAL: FitnessGate not clipping! Got {fitness}, "
+        f"expected <= {FitnessGate.MAX_FITNESS}. "
+        f"Running code does not match committed code. RESTART REQUIRED."
+    )
+    
+    assert FitnessGate.MAX_FITNESS == 1000.0, (
+        f"CRITICAL: Wrong cap value: {FitnessGate.MAX_FITNESS}"
+    )
+    
+    print(f"[VERIFY] FitnessGate active: MAX_FITNESS={FitnessGate.MAX_FITNESS}")
+
+# Call this in OmegaEngine.start() before starting loops
+_verify_hardening_active()
+```
+
+---
+
+The Clean Restart Procedure
+
+Since your live process is stale, you need a stateful restart that preserves:
+
+1. Population (so evolution doesn't reset to Gen 0)
+2. Hall of Fame (so learned strategies aren't lost)
+3. Inventory state (so Gravity LP knows its position)
+
+```python
+# Add to omega_engine.py
+
+async def checkpoint(self, path: str = "checkpoints/engine_state.json"):
+    """Serialize state for restart without data loss."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    
+    state = {
+        "timestamp": time.time(),
+        "generation": getattr(self.gp_engine, 'generation', 0),
+        "population": [
+            {
+                "id": g.id,
+                "source": g.source,
+                "fitness": g.fitness,
+                "sharpe": g.sharpe,
+                "n_ops": g.n_ops,
+                "lineage_id": g.lineage_id,
+            }
+            for g in getattr(self.gp_engine, 'population', [])
+        ],
+        "hall_of_fame": getattr(self.gp_engine, 'hall_of_fame', []),
+        "inventory": {
+            mid: {
+                "pm_yes_shares": inv.pm_yes_shares,
+                "perp_delta": inv.perp_delta,
+            }
+            for mid, inv in (self.gravity.inventory if self.gravity else {}).items()
+        },
+        "daily_pnl": self.daily_pnl,
+        "peak_pnl": self.peak_pnl,
+    }
+    
+    with open(path, 'w') as f:
+        json.dump(state, f, indent=2)
+    
+    logger.info(f"[CHECKPOINT] State saved to {path}")
+
+async def restore(self, path: str = "checkpoints/engine_state.json"):
+    """Restore state from checkpoint."""
+    if not os.path.exists(path):
+        logger.info("[RESTORE] No checkpoint found, starting fresh")
+        return
+    
+    with open(path, 'r') as f:
+        state = json.load(f)
+    
+    # Restore GP state
+    if self.gp_engine:
+        self.gp_engine.generation = state.get("generation", 0)
+        # Rebuild population from serialized genomes...
+    
+    # Restore inventory
+    if self.gravity:
+        for mid, inv_data in state.get("inventory", {}).items():
+            self.gravity.inventory[mid] = InventoryState(
+                market_id=mid,
+                pm_yes_shares=inv_data["pm_yes_shares"],
+                perp_delta=inv_data["perp_delta"],
+            )
+    
+    self.daily_pnl = state.get("daily_pnl", 0.0)
+    self.peak_pnl = state.get("peak_pnl", 0.0)
+    
+    logger.info(f"[RESTORE] State loaded from {path} (Gen {state.get('generation', 0)})")
+```
+
+Restart sequence:
+
+```bash
+# 1. Checkpoint live state
+curl -X POST http://localhost:8000/checkpoint
+
+# 2. Kill the stale process
+pkill -f "python run.py"
+
+# 3. Start fresh (picks up new code)
+python run.py
+
+# 4. Restore state
+curl -X POST http://localhost:8000/restore
+```
+
+---
+
+The Deeper Fix: Separate Evaluation from Evolution
+
+The real architectural issue is that `genetic_strategy_engine.py` computes fitness inside the evolution loop. If the evaluation function is stale, the selector is stale, and the entire population drifts toward the bug.
+
+Separate them:
+
+```python
+# evaluation_service.py — runs in its own process, reloads independently
+
+from src.patches.vm_hardening_patch import FitnessGate
+
+class EvaluationService:
+    """Stateless fitness evaluator. Can be restarted without losing GP state."""
+    
+    def evaluate(self, genome_source: str, backtest_df: pd.DataFrame) -> dict:
+        # Compile and execute in fresh VM every time
+        # No cached bytecode, no stale state
+        ...
+        return FitnessGate.evaluate(signals, backtest_df)
+```
+
+The GP engine calls this via HTTP or IPC. If the evaluator is stale, restart just the evaluator — the GP population survives.
+
+---
+
+What to Do Right Now
+
+1. Stop the live Replit process — it's poisoning your population with unbounded fitness
+2. Run the verification script above to confirm the new code loads correctly
+3. Checkpoint state (population + inventory) so you don't lose Gen 18 progress
+4. Restart with the hardened code
+5. Add the `_fitness_cap` probe to the audit log so you can verify in real-time
+6. Add the hot-reload loop so this class of error is caught in 30 seconds, not 16 hours
+
+Your forensic work here is exactly the kind of rigor that makes the rest of the stack credible. The bug wasn't in the fix — it was in the assumption that committing code deploys it. Now you have tooling to close that gap.
+
+Want me to write the full `evaluation_service.py` decoupling, or the checkpoint/restore endpoints for the aiohttp server?
