@@ -1,0 +1,27 @@
+{
+  "timestamp": 1785899077.8401384,
+  "generation": 0,
+  "population": [],
+  "hall_of_fame": [
+    {
+      "id": "hof-seed-1",
+      "name": "Momentum Reversion Alpha",
+      "expression": "if_else(gt(rsi, 0.5), sub(0, ma_fast), mul(mid, 1.0))",
+      "outOfSampleSharpe": 2.14,
+      "maxDrawdown": -12.4,
+      "complexityScore": 15,
+      "dateAdded": "2026-07-31T00:00:00.000Z"
+    },
+    {
+      "id": "hof-seed-2",
+      "name": "Vol-Adjusted Carry",
+      "expression": "div(sub(momentum, zscore), max(volatility, 0.01))",
+      "outOfSampleSharpe": 1.85,
+      "maxDrawdown": -8.2,
+      "complexityScore": 9,
+      "dateAdded": "2026-07-28T00:00:00.000Z"
+    }
+  ],
+  "daily_pnl": 0.0,
+  "peak_pnl": 0.0
+}

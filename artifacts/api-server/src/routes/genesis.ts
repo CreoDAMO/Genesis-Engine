@@ -59,6 +59,10 @@ router.get("/omega-dashboard", (req, res) =>
   proxyToEngine("/omega-dashboard", req, res),
 );
 
+// Checkpoint / restore — serialize and reload GP population without losing progress
+router.post("/checkpoint", (req, res) => proxyToEngine("/checkpoint", req, res));
+router.post("/restore",    (req, res) => proxyToEngine("/restore",    req, res));
+
 // Writes
 router.post("/settings", (req, res) => proxyToEngine("/settings", req, res));
 router.post("/hall-of-fame", (req, res) =>

@@ -118,6 +118,38 @@ class OmegaConfig:
 # Omega Engine
 # ---------------------------------------------------------------------------
 
+def _verify_hardening_active() -> None:
+    """
+    Fail-fast startup assertion.
+
+    Proves that the live process loaded the hardened FitnessGate, not stale
+    bytecode from before the patch was committed. If this raises, kill and
+    restart the process — the running code does not match the repository.
+    """
+    import numpy as _np
+    try:
+        from patches.vm_hardening_patch import FitnessGate as _FG
+    except ImportError:
+        from src.patches.vm_hardening_patch import FitnessGate as _FG
+
+    # A raw fitness that would blow through without the cap
+    _test_raw     = 2_000_000.0
+    _test_sharpe  = 1.5                         # positive so gate-3 doesn't fire
+    _test_returns = _np.array([0.01] * 20)
+
+    gated, _, _, _ = _FG.gate(_test_raw, _test_sharpe, _test_returns)
+
+    assert abs(gated) <= _FG.MAX_FITNESS, (
+        f"CRITICAL: FitnessGate not clipping — got {gated}, "
+        f"expected ≤ {_FG.MAX_FITNESS}. "
+        f"Stale bytecode in memory. RESTART REQUIRED."
+    )
+    assert _FG.MAX_FITNESS == 1_000.0, (
+        f"CRITICAL: Wrong cap — MAX_FITNESS={_FG.MAX_FITNESS}, expected 1000.0"
+    )
+    logger.info(f"[VERIFY] FitnessGate active: MAX_FITNESS={_FG.MAX_FITNESS} ✓")
+
+
 class OmegaEngine:
     """
     Practical v6 trading engine.
@@ -156,6 +188,14 @@ class OmegaEngine:
 
         # Ensure log dir exists
         Path(self.cfg.audit_log_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(ROOT / "checkpoints").mkdir(parents=True, exist_ok=True)
+
+        # Hot-reload: track mtime of vm_hardening_patch so changes are caught live
+        self._patch_path = str(SRC / "patches" / "vm_hardening_patch.py")
+        try:
+            self._patch_mtime = os.path.getmtime(self._patch_path)
+        except FileNotFoundError:
+            self._patch_mtime = 0.0
 
         logger.info("OmegaEngine initialized")
         logger.info(f"  Paper trade: {self.cfg.paper_trade}")
@@ -239,6 +279,9 @@ class OmegaEngine:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self._signal_handler)
 
+        # 8. Startup assertion — fail fast if stale bytecode is in memory
+        _verify_hardening_active()
+
         self.is_running = True
         self._write_audit({"event": "startup", "paper_trade": self.cfg.paper_trade})
 
@@ -248,6 +291,7 @@ class OmegaEngine:
             self._risk_monitor_loop(),
             self._gp_evolution_loop(),
             self._audit_loop(),
+            self._hot_reload_loop(),
         )
 
     def _signal_handler(self):
@@ -440,6 +484,63 @@ class OmegaEngine:
 
         logger.info("[Loop] GP evolution stopped")
 
+    async def _hot_reload_loop(self):
+        """
+        Watch vm_hardening_patch.py for on-disk changes every 30 s.
+
+        When the file changes, reload the module and re-inject the updated
+        FitnessGate / AuditSanitizer into the GP engine's module namespace so
+        the fix takes effect without a full process restart.
+        """
+        import importlib
+        logger.info("[Loop] Hot-reload watcher started")
+
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(30.0)
+            try:
+                current_mtime = os.path.getmtime(self._patch_path)
+                if current_mtime <= self._patch_mtime:
+                    continue
+
+                self._patch_mtime = current_mtime
+                logger.critical(
+                    "[HOT RELOAD] vm_hardening_patch.py changed on disk — reloading"
+                )
+
+                # Reload the patch module
+                import patches.vm_hardening_patch as _vmp
+                importlib.reload(_vmp)
+
+                # Re-inject into genetic_strategy_engine's module-level namespace
+                # so every subsequent evaluate() call picks up the new classes.
+                try:
+                    import vm.genetic_strategy_engine as _gse
+                    _gse._FitnessGate    = _vmp.FitnessGate
+                    _gse._AuditSanitizer = _vmp.AuditSanitizer
+                    _gse._V6_HARDENING   = True
+                except Exception as inject_err:
+                    logger.error(f"[HOT RELOAD] Namespace inject failed: {inject_err}")
+
+                # Verify the reload actually clips
+                test_gated, _, _, _ = _vmp.FitnessGate.gate(
+                    2_000_000.0, 1.5, np.array([0.01] * 20)
+                )
+                assert abs(test_gated) <= _vmp.FitnessGate.MAX_FITNESS
+                logger.critical(
+                    f"[HOT RELOAD] Reload verified ✓  "
+                    f"MAX_FITNESS={_vmp.FitnessGate.MAX_FITNESS}"
+                )
+                self._write_audit({
+                    "event": "hot_reload",
+                    "patch": self._patch_path,
+                    "max_fitness": _vmp.FitnessGate.MAX_FITNESS,
+                })
+
+            except Exception as e:
+                logger.error(f"[HOT RELOAD] Error: {e}")
+
+        logger.info("[Loop] Hot-reload watcher stopped")
+
     async def _audit_loop(self):
         """Write heartbeat audit record every 60 s."""
         while not self._shutdown_event.is_set():
@@ -496,6 +597,157 @@ class OmegaEngine:
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Checkpoint / Restore
+    # ------------------------------------------------------------------
+
+    async def checkpoint(self, path: str = "checkpoints/engine_state.json") -> str:
+        """
+        Serialize live engine state to JSON so a restart doesn't lose progress.
+
+        Saves: generation, full population (source/fitness/sharpe/metadata),
+        hall_of_fame, inventory, and session P&L.
+        """
+        import ast as _ast
+
+        pop_data = []
+        if self.gp_engine is not None:
+            for g in self.gp_engine.population:
+                pop_data.append({
+                    "genome_id":  g.genome_id,
+                    "source":     g.source,
+                    "fitness":    g.fitness if (g.fitness == g.fitness) else -1e6,
+                    "sharpe":     g.sharpe,
+                    "generation": g.generation,
+                    "parent_ids": g.parent_ids,
+                    "n_evals":    g.n_evals,
+                })
+
+        hof_data = []
+        if self.gp_engine is not None:
+            for g in self.gp_engine.hall_of_fame:
+                hof_data.append({
+                    "genome_id":  g.genome_id,
+                    "source":     g.source,
+                    "fitness":    g.fitness if (g.fitness == g.fitness) else -1e6,
+                    "sharpe":     g.sharpe,
+                    "generation": g.generation,
+                })
+
+        inv_data = {}
+        if self.gravity is not None:
+            for mid, inv in self.gravity.inventory.items():
+                inv_data[mid] = {
+                    "pm_yes_shares": inv.pm_yes_shares,
+                    "perp_delta":    inv.perp_delta,
+                }
+
+        state = {
+            "timestamp":  time.time(),
+            "generation": getattr(self.gp_engine, "generation", 0) if self.gp_engine else 0,
+            "population": pop_data,
+            "hall_of_fame": hof_data,
+            "inventory":  inv_data,
+            "daily_pnl":  self.daily_pnl,
+            "peak_pnl":   self.peak_pnl,
+            "quote_count": self.quote_count,
+            "fill_count":  self.fill_count,
+        }
+
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(state, f, indent=2)
+
+        self._write_audit({"event": "checkpoint", "path": path, "generation": state["generation"]})
+        logger.info(f"[CHECKPOINT] Saved to {path}  (gen={state['generation']}, pop={len(pop_data)})")
+        return path
+
+    async def restore(self, path: str = "checkpoints/engine_state.json") -> bool:
+        """
+        Restore engine state from a checkpoint produced by checkpoint().
+
+        Population genomes are rebuilt from their source strings (AST recompile);
+        inventory and P&L counters are patched directly onto the live objects.
+        Returns True on success, False if the file doesn't exist.
+        """
+        if not os.path.exists(path):
+            logger.info(f"[RESTORE] No checkpoint at {path} — starting fresh")
+            return False
+
+        with open(path) as f:
+            state = json.load(f)
+
+        # Restore GP state
+        if self.gp_engine is not None:
+            import ast as _ast
+            from vm.genetic_strategy_engine import StrategyGenome
+
+            new_pop = []
+            for gd in state.get("population", []):
+                try:
+                    tree = _ast.parse(gd["source"], mode="eval").body
+                    g = StrategyGenome(
+                        ast_tree    = tree,
+                        source      = gd["source"],
+                        fitness     = gd.get("fitness", -1e6),
+                        sharpe      = gd.get("sharpe", 0.0),
+                        generation  = gd.get("generation", 0),
+                        parent_ids  = gd.get("parent_ids", []),
+                        genome_id   = gd.get("genome_id", str(uuid.uuid4())[:8]),
+                        n_evals     = gd.get("n_evals", 1),
+                    )
+                    new_pop.append(g)
+                except Exception as e:
+                    logger.debug(f"[RESTORE] Skipping genome (parse error): {e}")
+
+            if new_pop:
+                self.gp_engine.population  = new_pop
+                self.gp_engine.generation  = state.get("generation", 0)
+
+            # Restore Hall of Fame
+            hof = []
+            for gd in state.get("hall_of_fame", []):
+                try:
+                    tree = _ast.parse(gd["source"], mode="eval").body
+                    g = StrategyGenome(
+                        ast_tree   = tree,
+                        source     = gd["source"],
+                        fitness    = gd.get("fitness", -1e6),
+                        sharpe     = gd.get("sharpe", 0.0),
+                        generation = gd.get("generation", 0),
+                        genome_id  = gd.get("genome_id", str(uuid.uuid4())[:8]),
+                    )
+                    hof.append(g)
+                except Exception:
+                    pass
+            if hof:
+                self.gp_engine.hall_of_fame = hof
+
+        # Restore inventory
+        if self.gravity is not None:
+            from gravity.lp_dominance import InventoryState
+            for mid, inv_d in state.get("inventory", {}).items():
+                self.gravity.inventory[mid] = InventoryState(
+                    market_id      = mid,
+                    pm_yes_shares  = inv_d.get("pm_yes_shares", 0.0),
+                    perp_delta     = inv_d.get("perp_delta", 0.0),
+                )
+
+        # Restore counters
+        self.daily_pnl   = state.get("daily_pnl", 0.0)
+        self.peak_pnl    = state.get("peak_pnl", 0.0)
+        self.quote_count = state.get("quote_count", 0)
+        self.fill_count  = state.get("fill_count", 0)
+
+        gen = state.get("generation", 0)
+        self._write_audit({"event": "restore", "path": path, "generation": gen})
+        logger.info(
+            f"[RESTORE] Loaded from {path}  "
+            f"(gen={gen}, pop={len(state.get('population', []))}, "
+            f"hof={len(state.get('hall_of_fame', []))})"
+        )
+        return True
 
     def get_dashboard(self) -> dict:
         """JSON-serializable status snapshot (exposed by api_server)."""

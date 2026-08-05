@@ -314,6 +314,130 @@ async def handle_settings(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "settings": state.settings})
 
 
+async def handle_checkpoint(request: web.Request) -> web.Response:
+    """
+    POST /checkpoint — serialize GP population + inventory to disk.
+
+    Call this before restarting the process so evolution progress isn't lost.
+    Response: {"ok": true, "path": "<file>", "generation": N}
+    """
+    import json as _json
+    import math as _math
+
+    pop = state.gp_engine.population if state.gp_engine else []
+    hof = state.hall_of_fame
+
+    pop_data = []
+    for g in pop:
+        fit = float(g.fitness) if _math.isfinite(getattr(g, "fitness", float("nan"))) else -1e6
+        pop_data.append({
+            "genome_id":  g.genome_id,
+            "source":     g.source,
+            "fitness":    fit,
+            "sharpe":     float(getattr(g, "sharpe", 0.0)),
+            "generation": getattr(g, "generation", 0),
+            "parent_ids": getattr(g, "parent_ids", []),
+            "n_evals":    getattr(g, "n_evals", 0),
+        })
+
+    hof_data = []
+    for e in hof:
+        if isinstance(e, dict):
+            hof_data.append(e)
+        else:
+            hof_data.append({
+                "genome_id":  getattr(e, "genome_id", ""),
+                "source":     getattr(e, "source", ""),
+                "fitness":    float(getattr(e, "fitness", -1e6)),
+                "sharpe":     float(getattr(e, "sharpe", 0.0)),
+                "generation": getattr(e, "generation", 0),
+            })
+
+    checkpoint_state = {
+        "timestamp":    __import__("time").time(),
+        "generation":   state.generation,
+        "population":   pop_data,
+        "hall_of_fame": hof_data,
+        "daily_pnl":    0.0,
+        "peak_pnl":     0.0,
+    }
+
+    import os as _os
+    _os.makedirs("checkpoints", exist_ok=True)
+    path = "checkpoints/engine_state.json"
+    with open(path, "w") as f:
+        _json.dump(checkpoint_state, f, indent=2)
+
+    state.add_audit("CHECKPOINT_SAVED", f"gen={state.generation} pop={len(pop_data)}")
+    return web.json_response({
+        "ok":         True,
+        "path":       path,
+        "generation": state.generation,
+        "pop_size":   len(pop_data),
+        "hof_size":   len(hof_data),
+    })
+
+
+async def handle_restore(request: web.Request) -> web.Response:
+    """
+    POST /restore — reload population + hall-of-fame from the last checkpoint.
+
+    Rebuilds StrategyGenome objects from their source strings so the GP engine
+    resumes from the saved generation without resetting to Gen 0.
+    Response: {"ok": true, "generation": N, "pop_restored": K}
+    """
+    import json as _json
+    import ast as _ast
+    import os as _os
+
+    path = "checkpoints/engine_state.json"
+    if not _os.path.exists(path):
+        return web.json_response({"ok": False, "error": "No checkpoint found"}, status=404)
+
+    with open(path) as f:
+        saved = _json.load(f)
+
+    restored = 0
+    if state.gp_engine is not None:
+        from vm.genetic_strategy_engine import StrategyGenome
+        import uuid as _uuid
+
+        new_pop = []
+        for gd in saved.get("population", []):
+            try:
+                tree = _ast.parse(gd["source"], mode="eval").body
+                g = StrategyGenome(
+                    ast_tree   = tree,
+                    source     = gd["source"],
+                    fitness    = gd.get("fitness", -1e6),
+                    sharpe     = gd.get("sharpe", 0.0),
+                    generation = gd.get("generation", 0),
+                    parent_ids = gd.get("parent_ids", []),
+                    genome_id  = gd.get("genome_id", str(_uuid.uuid4())[:8]),
+                    n_evals    = gd.get("n_evals", 1),
+                )
+                new_pop.append(g)
+                restored += 1
+            except Exception:
+                pass
+
+        if new_pop:
+            state.gp_engine.population  = new_pop
+            state.gp_engine.generation  = saved.get("generation", 0)
+            state.generation            = saved.get("generation", 0)
+
+    state.add_audit(
+        "CHECKPOINT_RESTORED",
+        f"gen={saved.get('generation', 0)} pop_restored={restored}",
+    )
+    return web.json_response({
+        "ok":           True,
+        "generation":   saved.get("generation", 0),
+        "pop_restored": restored,
+        "path":         path,
+    })
+
+
 async def handle_omega_dashboard(request: web.Request) -> web.Response:
     """
     Omega dashboard snapshot consumed by the React Market Making terminal.
@@ -414,6 +538,8 @@ async def cors_middleware(request: web.Request, handler: Any) -> web.Response:
 def create_app() -> web.Application:
     app = web.Application(middlewares=[cors_middleware])
     app.router.add_get("/healthz", handle_health)
+    app.router.add_post("/checkpoint", handle_checkpoint)
+    app.router.add_post("/restore", handle_restore)
     app.router.add_get("/omega-dashboard", handle_omega_dashboard)
     app.router.add_get("/status", handle_status)
     app.router.add_post("/start", handle_start)

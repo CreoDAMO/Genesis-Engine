@@ -409,6 +409,13 @@ class GeneticStrategyEngine:
                 fitness=fitness,
                 sharpe=round(sharpe, 4),
                 fuel_limit=MAX_FUEL,
+                # v6 hardening probe: confirms which FitnessGate code is running.
+                # If _fitness_cap is 'DISABLED' or 'MISSING' but |fitness| > 1000,
+                # the live process loaded stale bytecode and must be restarted.
+                _fitness_cap=(
+                    getattr(_FitnessGate, "MAX_FITNESS", "MISSING")
+                    if _V6_HARDENING else "DISABLED"
+                ),
                 extra={"generation": genome.generation},
             )
             # v6 hardening: sanitize before writing to chain
