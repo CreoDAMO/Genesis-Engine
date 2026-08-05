@@ -1,0 +1,15 @@
+I cloned the repo and traced this all the way to a root cause. Here's what's actually going on:
+
+**The fitness hard cap is being violated in ~32% of all evaluations** — 8,518 of 26,532 records in `audit_live.jsonl` have `|fitness| > 1000`, despite the README and `vm_hardening_patch.py`'s own docstring stating FitnessGate clips fitness to ±1000. Real values in the log go as high as **132,267,995** and as low as **-1,244,999**.
+
+**Why, confirmed via git history:**
+- `genetic_strategy_engine.py` was first created at **06:15:52 UTC** with *unguarded* `raw_fitness = sharpe * max(0, calmar) * winrate * occam` — no cap at all. Your audit log starts 23 seconds later.
+- `vm_hardening_patch.py` (FitnessGate) didn't exist in the repo until commit `d6017ad` at **22:12:10 UTC** — over 16 hours later, by which point ~2,800 uncapped evaluations had already been logged.
+- Here's the real problem: **violations continued after that commit landed.** Before 22:12:10: 443/2,804 evals violated the cap (15.8%). After 22:12:10: 8,075/23,728 violated (**34.0%** — worse, not better), with the single largest violation (132M) occurring at 22:42, thirty minutes after the "fix" was committed.
+- I checked out `main` fresh and ran the actual import — `FitnessGate.gate()` works correctly and does clip to ±1000 when the current code runs. So the committed fix is not broken. **The live Replit process generating this log simply never picked it up** — it's still running old, unguarded code in memory.
+
+One caveat worth noting: the "no positive-fitness-with-negative-Sharpe" invariant holds throughout the log with zero violations, but that's not evidence the gate is working — `raw_fitness`'s sign is mechanically tied to `sharpe`'s sign by the formula itself (since `calmar`, `winrate`, `occam` are all non-negative), so that invariant holds even with zero hardening active. It's a coincidence of the math, not a working safeguard.
+
+Chain integrity itself is solid — 0 unexplained hash-chain breaks, 0 NaN/Inf, just 5 legitimate "genesis" restarts matching engine restarts.
+
+**Bottom line:** the fix is real and correct in source, but production needs a restart/redeploy of `omega_engine.py` to actually load it — right now every strategy your GP engine is evolving against is being scored on unbounded, unsanitized fitness.
