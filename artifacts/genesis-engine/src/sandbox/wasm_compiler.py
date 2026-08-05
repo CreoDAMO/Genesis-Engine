@@ -139,7 +139,9 @@ class WASMStrategyCompiler:
         self._python_vm = SafePythonVM()
 
         if HAS_WASMTIME:
-            self._engine = wasmtime.Engine()
+            cfg = wasmtime.Config()
+            cfg.consume_fuel = True
+            self._engine = wasmtime.Engine(cfg)
             logger.info("WASM compiler initialized with wasmtime backend")
         else:
             self._engine = None
@@ -167,7 +169,7 @@ class WASMStrategyCompiler:
             wat = self._ast_to_wat(ast_source)
             if wat is not None:
                 try:
-                    wasm_bytes = wasmtime.Wat2Wasm(wat)
+                    wasm_bytes = wasmtime.wat2wasm(wat)
                 except Exception as e:
                     logger.warning(f"WASM compile failed for {strategy_id}: {e} — using fallback")
 
@@ -200,7 +202,7 @@ class WASMStrategyCompiler:
     def _execute_wasm(self, compiled: CompiledStrategy, features: List[float]) -> float:
         try:
             store = wasmtime.Store(self._engine)
-            store.add_fuel(self.fuel_limit)
+            store.set_fuel(self.fuel_limit)
             module = wasmtime.Module(self._engine, compiled.wasm_bytes)
             instance = wasmtime.Instance(store, module, [])
             strategy_fn = instance.exports(store)["strategy"]
@@ -313,18 +315,25 @@ class WASMStrategyCompiler:
                          "end"]
                     )
 
-                # sign(x) → 1.0 if x ≥ 0 else -1.0
+                # sign(x) → 1.0 if x > 0, -1.0 if x < 0, 0.0 if x == 0
                 if fn == "sign" and len(args) == 1:
                     tmp = _alloc()
                     return (
                         _emit(args[0]) +
                         [f"local.tee {tmp}",
                          "f64.const 0.0",
-                         "f64.ge",
+                         "f64.gt",
                          "if (result f64)",
                          "  f64.const 1.0",
                          "else",
-                         "  f64.const -1.0",
+                         f"  local.get {tmp}",
+                         "  f64.const 0.0",
+                         "  f64.lt",
+                         "  if (result f64)",
+                         "    f64.const -1.0",
+                         "  else",
+                         "    f64.const 0.0",
+                         "  end",
                          "end"]
                     )
 
